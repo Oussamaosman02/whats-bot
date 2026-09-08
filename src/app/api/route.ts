@@ -1,0 +1,70 @@
+import { route, ok } from "@/lib/api";
+import { env, features } from "@/lib/env";
+
+/** Index of every endpoint (also a smoke test that the server is up). */
+export const GET = route(async () => {
+  return ok({
+    name: env().BOT_NAME,
+    features: features(),
+    auth: env().API_KEY ? "Authorization: Bearer <API_KEY>" : "disabled (API_KEY empty)",
+    endpoints: {
+      health: ["GET /api/health"],
+      whatsapp: ["GET /api/whatsapp/status", "GET /api/whatsapp/qr (?format=png|json|html)", "POST /api/whatsapp/connect", "POST /api/whatsapp/disconnect", "POST /api/whatsapp/logout", "GET /api/whatsapp/check?phone="],
+      groups: [
+        "GET /api/groups?live=1",
+        "POST /api/groups {subject, participants[]}",
+        "GET /api/groups/:jid?live=1",
+        "PATCH /api/groups/:jid {subject?, description?, setting?}",
+        "DELETE /api/groups/:jid (leave)",
+        "GET /api/groups/:jid/participants",
+        "POST /api/groups/:jid/participants {participants[], action: add|promote|demote}",
+        "DELETE /api/groups/:jid/participants {participants[]}",
+        "GET /api/groups/:jid/invite",
+        "POST /api/groups/:jid/invite (revoke)",
+        "POST /api/groups/join {code|link}",
+        "GET /api/groups/invite-info?code=",
+        "GET /api/groups/:jid/messages?since&until&limit",
+        "POST /api/groups/:jid/summarize {since?, style?, focus?, deliver?: none|group|dm, to?}",
+        "POST /api/groups/:jid/ask {question, since?}",
+        "POST /api/groups/:jid/import?force=0|1  (multipart file=@export.zip | raw zip/txt)",
+      ],
+      chats: ["GET /api/chats?kind=group|dm", "GET /api/chats/:jid/messages?since&until&limit"],
+      messages: [
+        "POST /api/messages {to, text?, media?, quotedId?, via?: auto|baileys|zernio|cloud}",
+        "GET /api/messages?chat=&since=&limit=",
+        "GET /api/messages/:id/media?chat=",
+        "POST /api/messages/:id/react {chat, emoji}",
+        "POST /api/messages/:id/transcribe {chat, force?}",
+        "POST /api/messages/voice {to, text, voice?} (ElevenLabs → voice note)",
+        "GET /api/tts/status",
+        "POST /api/messages/sticker {to, sha256|url|imageBase64, crop?} (library sticker or image → WebP)",
+        "GET /api/stickers?search=&limit= (sticker library)",
+        "GET /api/stickers/:sha256 (webp, ?meta=1)",
+      ],
+      ai: ["GET /api/ai/models", "POST /api/ai/summarize {chatJid, since?, style?, focus?, language?, model?}", "POST /api/ai/ask {chatJid, question, since?}", "POST /api/ai/reply {chatJid, instruction?, send?}"],
+      summaries: ["GET /api/summaries?chat=&limit=", "GET /api/summaries/:id"],
+      zernio: [
+        "POST /api/webhooks/zernio (Zernio → us)",
+        "GET /api/zernio/accounts",
+        "GET /api/zernio/conversations?limit&cursor",
+        "GET /api/zernio/conversations/:id/messages",
+        "POST /api/zernio/conversations/:id/messages {message|attachmentUrl}",
+        "POST /api/zernio/send {phone, text? | templateName, templateLanguage?, templateParams?}",
+        "GET /api/zernio/templates",
+        "GET /api/zernio/webhooks",
+        "POST /api/zernio/webhooks {url?, secret?, events?} (register this app)",
+        "GET /api/zernio/contacts?search=",
+      ],
+      cloud: [
+        "GET/POST /api/cloud/groups",
+        "GET/PATCH/DELETE /api/cloud/groups/:id",
+        "GET/DELETE /api/cloud/groups/:id/participants",
+        "GET/POST /api/cloud/groups/:id/invite",
+        "POST /api/cloud/messages {to, text | template, group?}",
+        "GET/POST /api/cloud/webhook (Meta → us)",
+      ],
+      settings: ["GET /api/settings", "PUT /api/settings {...}"],
+      maintenance: ["GET /api/maintenance/retention (stats)", "POST /api/maintenance/retention {dryRun?, days?}", "POST /api/alerts/test {message?}", "POST /api/maintenance/backfill-stickers {dryRun?}", "POST /api/maintenance/recaption-stickers", "POST /api/maintenance/migrate-stickers (base64 → R2)"],
+    },
+  });
+});
