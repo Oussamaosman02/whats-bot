@@ -54,6 +54,8 @@ const schema = z.object({
     .transform((v) => v !== "false" && v !== "0"),
   ASSISTANT_MODEL: optionalString,
   ASSISTANT_DAILY_LIMIT: z.coerce.number().default(20),
+  /** audios (voice notes) a user can get from the assistant per day; ADMIN_PHONES exempt */
+  ASSISTANT_AUDIO_DAILY_LIMIT: z.coerce.number().default(5),
   ASSISTANT_CONTEXT_MESSAGES: z.coerce.number().default(30),
   ASK_KEYWORD_HITS: z.coerce.number().default(300),
   ASK_RECENT_MESSAGES: z.coerce.number().default(200),

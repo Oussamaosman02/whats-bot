@@ -16,7 +16,7 @@ import { whatsapp } from "../whatsapp/client";
 import type { NormalizedMessage } from "../whatsapp/types";
 import { fmtZoned } from "./since";
 import { runQuestion, runSummary } from "./service";
-import { countStickers, findMessageByWaId, getSticker, getStickerBytes, lastMessages, listStickers, randomSticker, setMessageTranscript, setReadMark } from "../store";
+import { bumpUsage, countStickers, findMessageByWaId, getSticker, getStickerBytes, getUsage, lastMessages, listStickers, randomSticker, setMessageTranscript, setReadMark } from "../store";
 
 const log = getLogger("assistant");
 
@@ -81,8 +81,20 @@ const TOOLS: ToolDef[] = [
 
 type ToolResult = { ok: boolean; sent?: boolean; info?: string };
 
-export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: { botPhone?: string; reqId: string; reply: (t: string) => Promise<unknown> }): Promise<void> {
+export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: { botPhone?: string; reqId: string; reply: (t: string) => Promise<unknown>; isAdmin?: boolean }): Promise<void> {
   const e = env();
+  const AUDIO_KIND = "assistant_audio";
+  /** true when this user may still get an audio today (ADMIN_PHONES exempt). */
+  const audioAllowed = async () => {
+    if (opts.isAdmin || e.ASSISTANT_AUDIO_DAILY_LIMIT <= 0 || !m.senderJid) return true;
+    return (await getUsage(m.senderJid, AUDIO_KIND)) < e.ASSISTANT_AUDIO_DAILY_LIMIT;
+  };
+  const audioUsed = async () => {
+    if (opts.isAdmin || !m.senderJid) return;
+    const n = await bumpUsage(m.senderJid, AUDIO_KIND);
+    log.info({ reqId: opts.reqId, user: m.senderPhone ?? m.senderJid, audiosToday: n, limit: e.ASSISTANT_AUDIO_DAILY_LIMIT }, "assistant audio counted");
+  };
+  const AUDIO_QUOTA_MSG = `audio quota reached: this user already got ${e.ASSISTANT_AUDIO_DAILY_LIMIT} audios today; tell them briefly (in their language) that the daily audio limit is ${e.ASSISTANT_AUDIO_DAILY_LIMIT} and offer the text version instead`;
   const alog = log.child({ reqId: opts.reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid });
   const cleaned = (m.text ?? "").replace(new RegExp(`@${opts.botPhone ?? "0000"}\\b`, "g"), "").replace(/@\S+/g, (x) => (x.toLowerCase().includes(e.BOT_NAME.toLowerCase()) ? "" : x)).trim();
   if (!cleaned) {
@@ -116,7 +128,12 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
     alog.info({ tool: name, args }, "assistant tool call");
     switch (name) {
       case "summarize_chat": {
-        const audio = Boolean(args.audio) && ttsEnabled();
+        let audio = Boolean(args.audio) && ttsEnabled();
+        let quotaNote = "";
+        if (audio && !(await audioAllowed())) {
+          audio = false;
+          quotaNote = ` (audio not sent: daily audio limit of ${e.ASSISTANT_AUDIO_DAILY_LIMIT} reached, text sent instead – mention it in one short sentence)`;
+        }
         const styleArg = String(args.style ?? "bullets");
         const style = audio ? (styleArg === "detailed" ? "spoken_detailed" : "spoken") : (styleArg as "bullets" | "brief" | "detailed");
         try {
@@ -125,26 +142,33 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
             await whatsapp.presence(m.chatJid, "recording");
             const a = await synthesize(res.text, { voice: "secondary", reqId: opts.reqId });
             await whatsapp.sendVoice(m.chatJid, a.buffer, { mimetype: a.mimetype, quotedId: m.id });
+            await audioUsed();
           } else {
             await opts.reply(`📝 *Resumen* – ${res.label}\n_${res.messageCount} mensajes · ${fmtZoned(res.from, tz)} → ${fmtZoned(res.to, tz)}_\n\n${res.text}`);
           }
           sentSomething = true;
-          return { ok: true, sent: true, info: `summary sent (${res.messageCount} messages, ${res.label})` };
+          return { ok: true, sent: true, info: `summary sent (${res.messageCount} messages, ${res.label})${quotaNote}` };
         } catch (err) {
           return { ok: false, info: isAppError(err) ? `${err.message} ${err.hint ?? ""}` : errInfo(err).message };
         }
       }
       case "answer_from_history": {
-        const audio = Boolean(args.audio) && ttsEnabled();
+        let audio = Boolean(args.audio) && ttsEnabled();
+        let quotaNote = "";
+        if (audio && !(await audioAllowed())) {
+          audio = false;
+          quotaNote = ` (audio not sent: daily audio limit of ${e.ASSISTANT_AUDIO_DAILY_LIMIT} reached, text sent instead – mention it in one short sentence)`;
+        }
         try {
           const res = await runQuestion({ chatJid: m.chatJid, question: String(args.question ?? cleaned), reqId: opts.reqId, spoken: audio });
           if (audio) {
             await whatsapp.presence(m.chatJid, "recording");
             const a = await synthesize(res.text, { voice: "secondary", reqId: opts.reqId });
             await whatsapp.sendVoice(m.chatJid, a.buffer, { mimetype: a.mimetype, quotedId: m.id });
+            await audioUsed();
           } else await opts.reply(res.text);
           sentSomething = true;
-          return { ok: true, sent: true, info: "answer sent" };
+          return { ok: true, sent: true, info: `answer sent${quotaNote}` };
         } catch (err) {
           return { ok: false, info: isAppError(err) ? `${err.message} ${err.hint ?? ""}` : errInfo(err).message };
         }
@@ -153,9 +177,11 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
         if (!ttsEnabled()) return { ok: false, info: "voice notes are not configured (ELEVENLABS_API_KEY)" };
         const text = String(args.text ?? "").trim();
         if (!text) return { ok: false, info: "empty text" };
+        if (!(await audioAllowed())) return { ok: false, info: AUDIO_QUOTA_MSG };
         await whatsapp.presence(m.chatJid, "recording");
         const a = await synthesize(text, { voice: "secondary", reqId: opts.reqId });
         await whatsapp.sendVoice(m.chatJid, a.buffer, { mimetype: a.mimetype, quotedId: m.id });
+        await audioUsed();
         sentSomething = true;
         return { ok: true, sent: true, info: `voice note sent (${a.chars} chars)` };
       }

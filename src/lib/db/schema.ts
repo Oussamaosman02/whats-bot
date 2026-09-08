@@ -161,6 +161,19 @@ export const mediaDescriptions = pgTable("media_descriptions", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Per-user daily counters (e.g. assistant audios). `day` is the local date in BOT_TIMEZONE (YYYY-MM-DD). */
+export const usageCounters = pgTable(
+  "usage_counters",
+  {
+    userJid: text("user_jid").notNull(),
+    kind: text("kind").notNull(),
+    day: text("day").notNull(),
+    count: integer("count").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.userJid, t.kind, t.day] })],
+);
+
 export const baileysAuth = pgTable("baileys_auth", {
   id: text("id").primaryKey(),
   data: text("data").notNull(), // BufferJSON-encoded

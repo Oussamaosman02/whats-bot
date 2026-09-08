@@ -84,7 +84,7 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
       }
     }
     try {
-      await whatsapp.withPresence(m.chatJid, "composing", () => runAssistant(m, raw, { botPhone, reqId, reply }));
+      await whatsapp.withPresence(m.chatJid, "composing", () => runAssistant(m, raw, { botPhone, reqId, reply, isAdmin: isAdmin(m.senderPhone) }));
     } catch (err) {
       alog.error({ err: errInfo(err), hint: isAppError(err) ? err.hint : "Assistant failed; see stack." }, "assistant failed");
       await reply(`⚠️ No he podido con eso (${isAppError(err) ? err.code : "error"}). Inténtalo de nuevo.`).catch(() => {});

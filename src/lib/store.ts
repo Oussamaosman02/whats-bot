@@ -384,6 +384,27 @@ export async function countAssistantCallsSince(userJid: string, since: Date, pre
   return r?.n ?? 0;
 }
 
+/** Local-day key (YYYY-MM-DD in BOT_TIMEZONE). */
+export function localDayKey(d = new Date()) {
+  const tz = process.env.BOT_TIMEZONE || "Europe/Madrid";
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+export async function getUsage(userJid: string, kind: string, day = localDayKey()) {
+  const rows = await db.select({ count: schema.usageCounters.count }).from(schema.usageCounters).where(and(eq(schema.usageCounters.userJid, userJid), eq(schema.usageCounters.kind, kind), eq(schema.usageCounters.day, day))).limit(1);
+  return rows[0]?.count ?? 0;
+}
+
+export async function bumpUsage(userJid: string, kind: string, day = localDayKey()) {
+  const rows = await db
+    .insert(schema.usageCounters)
+    .values({ userJid, kind, day, count: 1, updatedAt: new Date() })
+    .onConflictDoUpdate({ target: [schema.usageCounters.userJid, schema.usageCounters.kind, schema.usageCounters.day], set: { count: dsql`${schema.usageCounters.count} + 1`, updatedAt: new Date() } })
+    .returning({ count: schema.usageCounters.count });
+  return rows[0]?.count ?? 1;
+}
+
 export async function getReadMark(chatJid: string, userJid: string) {
   const rows = await db.select().from(schema.readMarks).where(and(eq(schema.readMarks.chatJid, chatJid), eq(schema.readMarks.userJid, userJid))).limit(1);
   return rows[0];
