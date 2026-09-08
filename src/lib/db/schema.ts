@@ -1,0 +1,173 @@
+/**
+ * Drizzle schema (Postgres / Neon).
+ *
+ * Tables:
+ *   chats            – every group / DM the bot has seen
+ *   participants     – group membership snapshot
+ *   messages         – every message (from Baileys, Zernio or Meta Cloud), deduped
+ *   summaries        – generated summaries (audit + "resume from where I left")
+ *   read_marks       – per (chat, user) pointer of the last summary delivered
+ *   webhook_events   – inbound webhook ids for idempotency
+ *   settings         – key/value runtime settings (bot config, worker status…)
+ *   baileys_auth     – Baileys credentials/keys so the worker is stateless
+ */
+import {
+  pgTable,
+  text,
+  boolean,
+  integer,
+  timestamp,
+  jsonb,
+  serial,
+  primaryKey,
+  index,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+
+export const chats = pgTable("chats", {
+  jid: text("jid").primaryKey(),
+  kind: text("kind").$type<"group" | "dm">().notNull(),
+  name: text("name"),
+  botIsMember: boolean("bot_is_member").notNull().default(true),
+  participantCount: integer("participant_count"),
+  description: text("description"),
+  metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+  lastMessageAt: timestamp("last_message_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const participants = pgTable(
+  "participants",
+  {
+    chatJid: text("chat_jid").notNull(),
+    userJid: text("user_jid").notNull(),
+    phone: text("phone"),
+    name: text("name"),
+    isAdmin: boolean("is_admin").notNull().default(false),
+    leftAt: timestamp("left_at", { withTimezone: true }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.chatJid, t.userJid] }), index("participants_user_idx").on(t.userJid)],
+);
+
+export type MessageSource = "baileys" | "zernio" | "cloud" | "import";
+
+export const messages = pgTable(
+  "messages",
+  {
+    id: serial("id").primaryKey(),
+    waId: text("wa_id").notNull(),
+    chatJid: text("chat_jid").notNull(),
+    senderJid: text("sender_jid"),
+    senderPhone: text("sender_phone"),
+    senderName: text("sender_name"),
+    fromMe: boolean("from_me").notNull().default(false),
+    type: text("type").notNull().default("text"),
+    text: text("text"),
+    media: jsonb("media").$type<Record<string, unknown>>(),
+    quotedId: text("quoted_id"),
+    mentions: jsonb("mentions").$type<string[]>(),
+    source: text("source").$type<MessageSource>().notNull(),
+    isCommand: boolean("is_command").notNull().default(false),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    raw: jsonb("raw").$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("messages_chat_wa_idx").on(t.chatJid, t.waId),
+    index("messages_chat_ts_idx").on(t.chatJid, t.timestamp),
+    index("messages_sender_idx").on(t.senderJid),
+  ],
+);
+
+export const summaries = pgTable(
+  "summaries",
+  {
+    id: serial("id").primaryKey(),
+    chatJid: text("chat_jid").notNull(),
+    requestedBy: text("requested_by"),
+    trigger: text("trigger").notNull().default("api"), // api | command
+    fromTs: timestamp("from_ts", { withTimezone: true }).notNull(),
+    toTs: timestamp("to_ts", { withTimezone: true }).notNull(),
+    messageCount: integer("message_count").notNull(),
+    text: text("text").notNull(),
+    model: text("model").notNull(),
+    promptTokens: integer("prompt_tokens"),
+    completionTokens: integer("completion_tokens"),
+    deliveredTo: text("delivered_to"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("summaries_chat_idx").on(t.chatJid, t.createdAt)],
+);
+
+export const readMarks = pgTable(
+  "read_marks",
+  {
+    chatJid: text("chat_jid").notNull(),
+    userJid: text("user_jid").notNull(),
+    lastSummaryAt: timestamp("last_summary_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.chatJid, t.userJid] })],
+);
+
+export const webhookEvents = pgTable("webhook_events", {
+  id: text("id").primaryKey(),
+  provider: text("provider").notNull(),
+  event: text("event").notNull(),
+  payload: jsonb("payload").$type<Record<string, unknown>>(),
+  receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const settings = pgTable("settings", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").$type<unknown>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Sticker library: every sticker seen, with its file and an AI caption (humour/intent aware). */
+export const stickers = pgTable(
+  "stickers",
+  {
+    sha256: text("sha256").primaryKey(),
+    /** WebP bytes, base64 – only when R2 is not configured (legacy); otherwise null and `storageKey` is set */
+    data: text("data"),
+    /** R2 object key, e.g. stickers/<sha256hex>.webp */
+    storageKey: text("storage_key"),
+    mimetype: text("mimetype").notNull().default("image/webp"),
+    bytes: integer("bytes").notNull(),
+    isAnimated: boolean("is_animated").notNull().default(false),
+    caption: text("caption"),
+    /** short tags for search, e.g. ["risa","gato","sarcasmo"] */
+    tags: jsonb("tags").$type<string[]>(),
+    model: text("model"),
+    firstChatJid: text("first_chat_jid"),
+    firstSenderJid: text("first_sender_jid"),
+    firstSenderName: text("first_sender_name"),
+    timesSeen: integer("times_seen").notNull().default(1),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("stickers_last_seen_idx").on(t.lastSeenAt)],
+);
+
+/** Cache of Gemini descriptions of photos / video thumbnails keyed by file hash. */
+export const mediaDescriptions = pgTable("media_descriptions", {
+  sha256: text("sha256").primaryKey(),
+  kind: text("kind").notNull(),
+  description: text("description").notNull(),
+  model: text("model"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const baileysAuth = pgTable("baileys_auth", {
+  id: text("id").primaryKey(),
+  data: text("data").notNull(), // BufferJSON-encoded
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type Chat = typeof chats.$inferSelect;
+export type Message = typeof messages.$inferSelect;
+export type NewMessage = typeof messages.$inferInsert;
+export type Summary = typeof summaries.$inferSelect;
