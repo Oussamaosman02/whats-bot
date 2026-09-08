@@ -105,6 +105,11 @@ class WhatsAppClient {
     return this.sock?.user?.id;
   }
 
+  /** The bot's LID jid (groups with LID addressing mention it instead of the phone jid). */
+  get meLid(): string | undefined {
+    return (this.sock?.user as { lid?: string } | undefined)?.lid;
+  }
+
   private setStatus(s: ConnectionStatus, extra: Record<string, unknown> = {}) {
     if (s !== this.status) {
       log.info({ from: this.status, to: s, ...extra }, `connection status → ${s}`);

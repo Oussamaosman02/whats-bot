@@ -47,6 +47,14 @@ const schema = z.object({
   /** model for /preguntar: consolidating hundreds of near-duplicate hits needs the stronger 2.5-flash */
   ASK_MODEL: z.string().default("google/gemini-2.5-flash"),
   ASK_MAX_BULLETS: z.coerce.number().default(14),
+  /** @mention assistant mode (groups only) */
+  ASSISTANT_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v !== "false" && v !== "0"),
+  ASSISTANT_MODEL: optionalString,
+  ASSISTANT_DAILY_LIMIT: z.coerce.number().default(20),
+  ASSISTANT_CONTEXT_MESSAGES: z.coerce.number().default(30),
   ASK_KEYWORD_HITS: z.coerce.number().default(300),
   ASK_RECENT_MESSAGES: z.coerce.number().default(200),
   TRANSCRIBE_AUDIO: z

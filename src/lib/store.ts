@@ -375,6 +375,15 @@ export async function countUserSummariesSince(userJid: string, since: Date) {
   return r?.n ?? 0;
 }
 
+/** Assistant invocations by a user since `since` (command rows that are @mentions rather than slash commands). */
+export async function countAssistantCallsSince(userJid: string, since: Date, prefix: string) {
+  const [r] = await db
+    .select({ n: dsql<number>`count(*)::int` })
+    .from(schema.messages)
+    .where(and(eq(schema.messages.senderJid, userJid), eq(schema.messages.isCommand, true), gte(schema.messages.timestamp, since), dsql`${schema.messages.text} not like ${prefix + "%"}`));
+  return r?.n ?? 0;
+}
+
 export async function getReadMark(chatJid: string, userJid: string) {
   const rows = await db.select().from(schema.readMarks).where(and(eq(schema.readMarks.chatJid, chatJid), eq(schema.readMarks.userJid, userJid))).limit(1);
   return rows[0];

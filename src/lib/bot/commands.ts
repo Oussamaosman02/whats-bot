@@ -158,6 +158,7 @@ export function helpText(opts: { isDm: boolean }) {
     `Responde a una nota de voz con *${p}transcribir* para leerla, o *${p}transcribir breve* para quedarte solo con lo importante (las notas de voz ya se transcriben solas para los resúmenes).`,
     `*${p}sticker* – un sticker al azar · *${p}sticker <palabra>* – busca uno · respondiendo a un mensaje: el que mejor le pegue · respondiendo a una foto: la convierte en sticker.`,
   ];
+  if (!opts.isDm) lines.push(`Menciónáme (*@${bot}*) y pídemelo en lenguaje natural: "resume desde ayer", "haz un audio diciendo…", "manda un sticker de risa", o pregúntame lo que quieras.`);
   if (opts.isDm) {
     lines.push(`*${p}grupos* – lista los grupos que compartimos`, `*${p}resumen <nº o nombre del grupo> [periodo]* – resume ese grupo aquí`);
   } else {

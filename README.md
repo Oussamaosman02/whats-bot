@@ -14,6 +14,7 @@ Built as an API-only Next.js app that runs on one small server (Railway), uses G
 
 | Feature | How |
 |---|---|
+| **Assistant mode** | Mention the bot in a group (`@ResumenBot haz un audio diciendo feliz cumple Luis`, `@ResumenBot resume desde ayer en audio`, `@ResumenBot manda un sticker de risa`, `@ResumenBot ¿qué opinas de…?`) and Gemini decides what to do with tools: summarise, answer from history, create a voice note (secondary voice), send a sticker, transcribe, or just chat. Groups only; replying to the bot does not trigger it. |
 | **Catch-up summaries** | `/resumen` in the group → Gemini summary since your last summary, your last message, a day, or a date + time. Delivered in the group or by DM. |
 | **Ask the chat** | `/preguntar ¿qué se decidió de la cena?` → searches the whole stored history (keywords + recent context + archived summaries) and answers. |
 | **Voice notes in** | Every voice note is transcribed (Gemini audio) and becomes part of summaries. Reply to one with `/transcribir` to read it, or `/transcribir breve` for a TL;DR of a long one (the bot offers it itself past 60 s). |

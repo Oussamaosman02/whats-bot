@@ -25,6 +25,8 @@ import { join } from "node:path";
 import { rootLogger } from "../logger";
 import { importExportText, readExportFile } from "../import";
 import { synthesize, ttsEnabled } from "../ai/tts";
+import { runAssistant } from "./assistant";
+import { countAssistantCallsSince } from "../store";
 import { isLongVoiceNote, summarizeVoiceNote, transcribeAudio } from "../ai/transcribe";
 import { setMessageTranscript } from "../store";
 import { toStickerWebp } from "../whatsapp/sticker";
@@ -57,9 +59,39 @@ async function sendDm(userJid: string, text: string, reqId: string) {
 export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promise<void> {
   const reqId = m.id.slice(-8);
   const me = whatsapp.meJid;
+  const meLid = whatsapp.meLid;
   const botPhone = phoneFromJid(me);
-  const botMentioned = m.mentions.some((j) => phoneFromJid(j) === botPhone || j === me) || (botPhone ? (m.text ?? "").includes(`@${botPhone}`) : false);
+  const norm = (j: string) => j.split(":")[0].split("@")[0];
+  const botMentioned =
+    m.mentions.some((j) => (botPhone && phoneFromJid(j) === botPhone) || (me && norm(j) === norm(me)) || (meLid && norm(j) === norm(meLid))) ||
+    (botPhone ? (m.text ?? "").includes(`@${botPhone}`) : false);
   const isDm = m.chatKind === "dm";
+  const e = env();
+
+  // Assistant mode: explicit @mention in a GROUP with free text (slash commands still work as before).
+  // Quoting/replying to the bot does not count as a mention.
+  if (botMentioned && !isDm && e.ASSISTANT_ENABLED && !(m.text ?? "").trim().startsWith(e.BOT_COMMAND_PREFIX)) {
+    const alog = log.child({ reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid, mode: "assistant" });
+    alog.info({ text: m.text?.slice(0, 160) }, "assistant mention");
+    await markMessageAsCommand(m.chatJid, m.id).catch(() => {});
+    const reply = (text: string) => whatsapp.sendText(m.chatJid, text, { quotedId: m.id });
+    if (m.senderJid && e.ASSISTANT_DAILY_LIMIT > 0 && !isAdmin(m.senderPhone)) {
+      const p = zonedParts(new Date(), e.BOT_TIMEZONE);
+      const used = await countAssistantCallsSince(m.senderJid, zonedToUtc(p.y, p.m, p.d, 0, 0, e.BOT_TIMEZONE), e.BOT_COMMAND_PREFIX);
+      if (used > e.ASSISTANT_DAILY_LIMIT) {
+        await reply(`⛔ Has llegado al límite de ${e.ASSISTANT_DAILY_LIMIT} peticiones al asistente por hoy.`);
+        return;
+      }
+    }
+    try {
+      await whatsapp.withPresence(m.chatJid, "composing", () => runAssistant(m, raw, { botPhone, reqId, reply }));
+    } catch (err) {
+      alog.error({ err: errInfo(err), hint: isAppError(err) ? err.hint : "Assistant failed; see stack." }, "assistant failed");
+      await reply(`⚠️ No he podido con eso (${isAppError(err) ? err.code : "error"}). Inténtalo de nuevo.`).catch(() => {});
+    }
+    return;
+  }
+
   const cmd = parseCommand(m.text, { isDm, botMentioned, botPhone });
   if (!cmd) return;
 

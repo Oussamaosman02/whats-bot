@@ -13,14 +13,20 @@ export type ContentPart =
   | { type: "text"; text: string }
   | { type: "input_audio"; input_audio: { data: string; format: string } }
   | { type: "image_url"; image_url: { url: string } };
-export type ChatMessage = { role: "system" | "user" | "assistant"; content: string | ContentPart[] };
+export type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+export type ChatMessage =
+  | { role: "system" | "user"; content: string | ContentPart[] }
+  | { role: "assistant"; content: string | ContentPart[] | null; tool_calls?: ToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+export type ToolDef = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } };
 
 function contentChars(c: ChatMessage["content"]) {
+  if (!c) return 0;
   return typeof c === "string" ? c.length : c.reduce((n, p) => n + (p.type === "text" ? p.text.length : 0), 0);
 }
 function contentKinds(messages: ChatMessage[]) {
   const kinds = new Set<string>();
-  for (const m of messages) if (typeof m.content !== "string") for (const p of m.content) kinds.add(p.type);
+  for (const m of messages) if (m.content && typeof m.content !== "string") for (const p of m.content) kinds.add(p.type);
   return [...kinds];
 }
 
@@ -29,8 +35,9 @@ export type Completion = {
   model: string;
   promptTokens?: number;
   completionTokens?: number;
-  /** "stop" | "length" (hit max_tokens) | other provider values */
+  /** "stop" | "length" (hit max_tokens) | "tool_calls" | other provider values */
   finishReason?: string;
+  toolCalls?: ToolCall[];
   ms: number;
 };
 
@@ -55,11 +62,15 @@ export function resolveModel(override?: string): string {
 
 export async function chatComplete(
   messages: ChatMessage[],
-  opts: { model?: string; temperature?: number; maxTokens?: number; reqId?: string } = {},
+  opts: { model?: string; temperature?: number; maxTokens?: number; reqId?: string; tools?: ToolDef[]; toolChoice?: "auto" | "none" | "required" } = {},
 ): Promise<Completion> {
   const model = resolveModel(opts.model);
   const t0 = Date.now();
-  const body = { model, messages, temperature: opts.temperature ?? 0.3, max_tokens: opts.maxTokens ?? 2048 };
+  const body: Record<string, unknown> = { model, messages, temperature: opts.temperature ?? 0.3, max_tokens: opts.maxTokens ?? 2048 };
+  if (opts.tools?.length) {
+    body.tools = opts.tools;
+    body.tool_choice = opts.toolChoice ?? "auto";
+  }
   log.debug({ model, messages: messages.length, chars: messages.reduce((n, m) => n + contentChars(m.content), 0), parts: contentKinds(messages), reqId: opts.reqId }, "→ openrouter chat/completions");
 
   let res: Response;
@@ -93,16 +104,17 @@ export async function chatComplete(
     throw new AppError(502, "ai_upstream_error", `OpenRouter responded ${res.status} for model ${model}`, { hint, data: json.error ?? raw.slice(0, 800) });
   }
 
-  const choice = (json.choices as { message?: { content?: string }; finish_reason?: string }[] | undefined)?.[0];
+  const choice = (json.choices as { message?: { content?: string | null; tool_calls?: ToolCall[] }; finish_reason?: string }[] | undefined)?.[0];
   const text = choice?.message?.content?.trim() ?? "";
+  const toolCalls = choice?.message?.tool_calls;
   const usage = json.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
   const ms = Date.now() - t0;
-  log.info({ model, ms, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens, finish: choice?.finish_reason, reqId: opts.reqId }, "← openrouter ok");
-  if (!text) {
+  log.info({ model, ms, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens, finish: choice?.finish_reason, tools: toolCalls?.map((t) => t.function.name), reqId: opts.reqId }, "← openrouter ok");
+  if (!text && !toolCalls?.length) {
     throw new AppError(502, "ai_empty_response", "Gemini returned an empty response.", { hint: "Usually a safety filter or max_tokens=0; check `data`.", data: json });
   }
   if (choice?.finish_reason === "length") log.warn({ model, maxTokens: body.max_tokens, hint: "Output was cut by max_tokens; the caller trims the partial last line." }, "completion truncated");
-  return { text, model: (json.model as string) ?? model, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens, finishReason: choice?.finish_reason, ms };
+  return { text, model: (json.model as string) ?? model, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens, finishReason: choice?.finish_reason, toolCalls, ms };
 }
 
 /** List Gemini models available on OpenRouter for this key. */
