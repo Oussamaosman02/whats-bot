@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { rootLogger } from "../logger";
 import { importExportText, readExportFile } from "../import";
 import { synthesize, ttsEnabled } from "../ai/tts";
-import { transcribeAudio } from "../ai/transcribe";
+import { isLongVoiceNote, summarizeVoiceNote, transcribeAudio } from "../ai/transcribe";
 import { setMessageTranscript } from "../store";
 import { toStickerWebp } from "../whatsapp/sticker";
 
@@ -36,6 +36,12 @@ const COOLDOWN_MS = 15_000;
 function fmtRange(from: Date, to: Date) {
   const tz = env().BOT_TIMEZONE;
   return `${fmtZoned(from, tz)} → ${fmtZoned(to, tz)}`;
+}
+
+/** 75 → "1:15 min", 40 → "40 s" */
+function fmtSeconds(s: number) {
+  const n = Math.round(s);
+  return n < 60 ? `${n} s` : `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")} min`;
 }
 
 /** Sends a DM to a user, via Baileys or Zernio depending on DM_TRANSPORT. */
@@ -106,6 +112,7 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
           await reply("El mensaje citado no es una nota de voz.");
           return;
         }
+        const seconds = quoted.media?.seconds as number | undefined;
         let text = quoted.media?.transcript as string | undefined;
         if (!text) {
           const media = await whatsapp.getMediaBuffer(m.chatJid, m.quoted.id);
@@ -113,11 +120,23 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
             await reply("No puedo recuperar ese audio (es anterior a mi llegada o no se archivó).");
             return;
           }
-          const t = await transcribeAudio(media.buffer, { mimetype: media.mimetype ?? (quoted.media?.mimetype as string | undefined), reqId });
+          const t = await transcribeAudio(media.buffer, { mimetype: media.mimetype ?? (quoted.media?.mimetype as string | undefined), seconds, reqId });
           text = t.transcript;
           await setMessageTranscript(m.chatJid, quoted.waId, t.transcript, { model: t.model, ms: t.ms });
         }
-        await reply(text ? `🎤 *${quoted.senderName ?? "Nota de voz"}:*\n${text}` : "No he podido transcribir ese audio. Mira los logs (transcription failed).");
+        if (!text || text === "[inaudible]") {
+          await reply(text ? "En esa nota de voz no se entiende nada 🙈" : "No he podido transcribir ese audio. Mira los logs (transcription failed).");
+          return;
+        }
+        const who = quoted.senderName ?? "Nota de voz";
+        if (cmd.brief) {
+          // TL;DR: the point of the voice note in a few bullets (short ones come back as they are).
+          const s = await summarizeVoiceNote(text, { senderName: quoted.senderName ?? undefined, seconds, reqId });
+          await reply(s.condensed ? `🎤 *${who}* (resumen${seconds ? `, ${fmtSeconds(seconds)}` : ""}):\n${s.summary}` : `🎤 *${who}:*\n${s.summary}\n\n_(era corta, te la dejo entera)_`);
+          return;
+        }
+        const hint = isLongVoiceNote(text, seconds) ? `\n\n_${env().BOT_COMMAND_PREFIX}transcribir breve → solo lo importante_` : "";
+        await reply(`🎤 *${who}:*\n${text}${hint}`);
         return;
       }
       case "groups": {

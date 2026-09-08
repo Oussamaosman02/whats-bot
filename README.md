@@ -16,7 +16,7 @@ Built as an API-only Next.js app that runs on one small server (Railway), uses G
 |---|---|
 | **Catch-up summaries** | `/resumen` in the group → Gemini summary since your last summary, your last message, a day, or a date + time. Delivered in the group or by DM. |
 | **Ask the chat** | `/preguntar ¿qué se decidió de la cena?` → searches the whole stored history (keywords + recent context + archived summaries) and answers. |
-| **Voice notes in** | Every voice note is transcribed (Gemini audio) and becomes part of summaries. Reply to one with `/transcribir` to read it. |
+| **Voice notes in** | Every voice note is transcribed (Gemini audio) and becomes part of summaries. Reply to one with `/transcribir` to read it, or `/transcribir breve` for a TL;DR of a long one (the bot offers it itself past 60 s). |
 | **Voice notes out** | `/resumen audio`, `/preguntar audio …` → the answer is *written for the ear* by Gemini and voiced by ElevenLabs as a native WhatsApp voice note. |
 | **Stickers** | Every sticker the bot sees is stored and captioned by Gemini (humour/intent aware, animated ones too). `/sticker` sends a random one, `/sticker alonso` searches, and replying to someone with `/sticker` sends the funniest fitting sticker. Reply to a photo with `/sticker` to convert it. |
 | **Photos & videos** | Get a one-line description so summaries can say "Ana mandó una foto de la tarta". |
@@ -41,7 +41,7 @@ Everything is exposed as a REST API as well (`GET /api` lists every endpoint), p
 | `/preguntar <question>` · `/preguntar audio <question>` | answer from the chat history (text / voice) |
 | `/marcar` | "start counting from here" without summarising |
 | `/sticker` · `/sticker <word>` · reply with `/sticker` | random · search · best humorous reply (own message → random) · photo → sticker |
-| reply to a voice note with `/transcribir` | read it |
+| reply to a voice note with `/transcribir` · `/transcribir breve` | read it · just the gist (long voice notes) |
 | `/ayuda` · `/ping` · `/id` | help · liveness · ids |
 
 | By DM | |
@@ -127,7 +127,7 @@ The Dockerfile builds a standalone Next.js server. Keep **one replica** (`railwa
 |---|---|
 | Health & link | `GET /api/health` · `GET /api/whatsapp/qr` · `GET /api/whatsapp/status` · `POST /api/whatsapp/{connect,disconnect,logout}` |
 | Groups | `GET/POST /api/groups` · `GET/PATCH/DELETE /api/groups/:jid` · participants, invite, join · `GET …/messages` · `POST …/summarize` · `POST …/ask` · `POST …/import` |
-| Messages | `POST /api/messages` (text/media, routed to the right channel) · `POST /api/messages/voice` · `POST /api/messages/sticker` · `GET /api/messages/:id/media` · `POST /api/messages/:id/transcribe` · `POST /api/messages/:id/react` |
+| Messages | `POST /api/messages` (text/media, routed to the right channel) · `POST /api/messages/voice` · `POST /api/messages/sticker` · `GET /api/messages/:id/media` · `POST /api/messages/:id/transcribe` (`brief` → adds a TL;DR) · `POST /api/messages/:id/react` |
 | Stickers | `GET /api/stickers?search=` · `GET /api/stickers/:sha256` |
 | AI | `GET /api/ai/models` · `POST /api/ai/{summarize,ask,reply}` · `GET /api/tts/status` |
 | Summaries | `GET /api/summaries` · `GET /api/summaries/:id` |

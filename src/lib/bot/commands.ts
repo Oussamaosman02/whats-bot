@@ -5,6 +5,7 @@
  *   /resumen <grupo> [desde]                         (in DM) summarise a shared group
  *   /preguntar <pregunta>                            answer a question from the chat history
  *   /marcar                                          "start counting from here" (sets your read mark)
+ *   /transcribir [breve]                             (reply to a voice note) full transcript, or a TL;DR
  *   /grupos                                          (in DM) list groups you share with the bot
  *   /ayuda | /ping | /id
  */
@@ -16,7 +17,7 @@ export type Command =
   | { name: "say"; text: string }
   | { name: "sticker"; query: string }
   | { name: "mark" }
-  | { name: "transcribe" }
+  | { name: "transcribe"; brief: boolean }
   | { name: "import"; args: string[]; force: boolean }
   | { name: "groups" }
   | { name: "help" }
@@ -61,6 +62,7 @@ const ALIASES: Record<string, Command["name"]> = {
 
 const PRIVATE_WORDS = new Set(["privado", "private", "dm", "pv", "md"]);
 const AUDIO_WORDS = new Set(["audio", "voz", "voice", "nota"]);
+const BRIEF_WORDS = new Set(["resumen", "resume", "resumir", "resumido", "tldr", "tl;dr", "summary", "summarize", "sum"]);
 const STYLE_WORDS: Record<string, "brief" | "detailed"> = { breve: "brief", corto: "brief", brief: "brief", short: "brief", detallado: "detailed", detalle: "detailed", detailed: "detailed", largo: "detailed", long: "detailed" };
 
 /**
@@ -117,6 +119,9 @@ export function parseCommand(text: string | undefined, opts: { isDm: boolean; bo
       const audio = args.length > 0 && AUDIO_WORDS.has(args[0].toLowerCase());
       return { name: "ask", question: (audio ? args.slice(1) : args).join(" "), audio };
     }
+    case "transcribe":
+      // "/transcribir breve|resumen|tldr" → TL;DR of the quoted voice note instead of the full text
+      return { name: "transcribe", brief: args.some((a) => STYLE_WORDS[a.toLowerCase()] === "brief" || BRIEF_WORDS.has(a.toLowerCase())) };
     case "say":
       return { name: "say", text: args.join(" ") };
     case "sticker":
@@ -150,7 +155,7 @@ export function helpText(opts: { isDm: boolean }) {
     `Responde (cita) a un mensaje con *${p}resumen* para resumir desde ese punto.`,
     `*${p}preguntar* <pregunta> – pregunta sobre lo hablado en el chat`,
     `*${p}marcar* – "empieza a contar desde aquí" (sin resumir)`,
-    `Responde a una nota de voz con *${p}transcribir* para leerla (las notas de voz ya se transcriben solas para los resúmenes).`,
+    `Responde a una nota de voz con *${p}transcribir* para leerla, o *${p}transcribir breve* para quedarte solo con lo importante (las notas de voz ya se transcriben solas para los resúmenes).`,
     `*${p}sticker* – un sticker al azar · *${p}sticker <palabra>* – busca uno · respondiendo a un mensaje: el que mejor le pegue · respondiendo a una foto: la convierte en sticker.`,
   ];
   if (opts.isDm) {
