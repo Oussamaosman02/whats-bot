@@ -139,11 +139,28 @@ export async function runRetention(opts: { dryRun?: boolean; days?: number } = {
   return report;
 }
 
+/** Sticker messages whose library entry has a caption but the row does not (races, restarts) → copy it over. */
+export async function reconcileStickerCaptions(): Promise<number> {
+  const rows = await db.execute(dsql`
+    update messages m
+       set media = coalesce(m.media, '{}'::jsonb) || jsonb_build_object('description', '(sticker: ' || s.caption || ')'),
+           text  = coalesce(nullif(m.text, ''), '(sticker: ' || s.caption || ')')
+      from stickers s
+     where m.type = 'sticker' and m.media->>'description' is null and s.sha256 = m.media->>'sha256' and s.caption is not null
+     returning m.id`);
+  const n = Array.isArray(rows) ? rows.length : (rows as { length?: number }).length ?? 0;
+  if (n) log.info({ reconciled: n }, "sticker captions copied onto message rows");
+  return n;
+}
+
 let timer: NodeJS.Timeout | undefined;
 /** Start the hourly retention job (idempotent). */
 export function startRetentionScheduler() {
   if (timer) return;
-  const tick = () => runRetention().catch((e) => log.error({ err: errInfo(e), hint: "Retention job failed; old rows will be retried next hour. Check DATABASE_URL / Neon." }, "retention failed"));
+  const tick = () =>
+    runRetention()
+      .then(() => reconcileStickerCaptions())
+      .catch((e) => log.error({ err: errInfo(e), hint: "Retention job failed; old rows will be retried next hour. Check DATABASE_URL / Neon." }, "retention failed"));
   setTimeout(tick, 30_000);
   timer = setInterval(tick, 60 * 60_000);
   log.info({ days: env().RETENTION_DAYS }, "retention scheduler started (hourly)");

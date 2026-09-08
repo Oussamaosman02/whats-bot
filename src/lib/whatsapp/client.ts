@@ -222,7 +222,9 @@ class WhatsAppClient {
           // All async so they never delay other messages. Also runs when the Zernio webhook stored the row
           // first (its copy has no file) – see saveMessage().
           const firstTimeFromBaileys = saved.inserted || saved.enriched === true;
-          if (firstTimeFromBaileys && type === "notify") {
+          // "append" = delivered on (re)connect rather than live; still process media if it is recent and not ours
+          const recent = Date.now() - m.timestamp.getTime() < 6 * 3_600_000;
+          if (firstTimeFromBaileys && (type === "notify" || (type === "append" && recent && !m.fromMe))) {
             if (m.type === "audio") void this.archiveInbound(m, raw).then(() => this.transcribeInbound(m, raw));
             else if (m.type === "sticker" || m.type === "image" || m.type === "video") void this.archiveInbound(m, raw).then(() => this.describeInbound(m, raw));
             else if (m.type === "document") void this.archiveInbound(m, raw);
