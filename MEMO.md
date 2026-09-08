@@ -66,6 +66,11 @@ Rules: unknown period arguments are rejected with usage help (no guessing); 15 s
 20. **Zernio⇄Baileys dedupe by `wamid`**: Meta's `wamid` base64-encodes the WhatsApp Web message id, so Cloud-API copies of DMs are normalised to the same id and never duplicate the Baileys row. When Zernio's copy arrives first, the Baileys copy *enriches* it and still runs media processing (this race had silently skipped a batch of stickers).
 21. **Sticker recovery tools**: `POST /api/maintenance/backfill-stickers` (re-downloads stickers seen only via Zernio, using its media proxy + API key; recovered 68 in one go), `POST /api/maintenance/recaption-stickers` (fixes missing/malformed captions), `POST /api/maintenance/migrate-stickers` (base64 → R2).
 22. **Cloudflare R2 storage**: sticker files (`whats-bot/stickers/<sha>.webp`) and received media ≤ `MEDIA_ARCHIVE_MAX_MB` (`whats-bot/media/<chat>/<id>`) go to R2; media is downloaded once and shared with transcription/captioning; `/transcribir`, `/sticker` on old photos and `GET /api/messages/:id/media` fall back to R2 after restarts; retention deletes the day's objects with its messages. Stickers table shrank from 11 MB to 80 kB after migration (whole DB ≈ 15 MB).
+23. **Reconnect deliveries & caption reconcile**: media arriving through WhatsApp's reconnect path ("append") is processed like live messages; an hourly job copies library captions onto any sticker message that lacks one (7 rows fixed the first time).
+24. **Public repo, MIT**: `git init`, four logical commits, MIT license (free for anyone), public-facing README (features, commands, architecture, quick start, config table, API, privacy). `.env.example` scrubbed of personal numbers; live identifiers moved to the git-ignored `MEMO.private.md`. Repo: github.com/Oussamaosman02/whats-bot.
+25. **Assistant mode (@mention, groups only)**: mentioning the bot by name or number in a group (replies/quotes do not count; DMs excluded) sends the text + last 30 messages + quoted message to Gemini with tools: `summarize_chat`, `answer_from_history`, `send_voice_note`, `send_sticker`, `transcribe_quoted`, `set_read_mark`, or a plain text answer for anything else. Tools can chain; after a tool sends, the model adds at most one short sentence. All assistant audio uses the **secondary** ElevenLabs voice. Verified tool selection with Gemini via OpenRouter before deploying (`src/lib/bot/assistant.ts`).
+26. **Assistant quotas**: 20 requests and **3 audios** per user per day (`ASSISTANT_DAILY_LIMIT`, `ASSISTANT_AUDIO_DAILY_LIMIT`), `ADMIN_PHONES` exempt. Audio counts live in a new `usage_counters` table (user, kind, local day). When the audio quota is hit, summaries/answers fall back to text with a one-line note; custom audios get a short refusal. Counts were back-filled for the audios sent before the counter existed.
+27. **Voice-note TL;DR** (from a parallel session): `/transcribir breve|resumen|tldr` replies with 2–5 bullets; long transcripts (≥ 60 s or ≥ 700 chars) end with a hint offering it; `POST /api/messages/:id/transcribe {brief:true}` returns `summary`. `TODO.md` holds a ranked feature backlog grounded in X/Reddit research (expenses, reminders, action items, lists, scheduled digest, welcome brief, events, stats, links library…).
 
 ## 4. Live state (as of 2026-09-08)
 
@@ -75,8 +80,10 @@ Rules: unknown period arguments are rejected with usage help (no guessing); 15 s
 - Secrets live in Railway variables (`railway variables`): `API_KEY`, `DASHBOARD_PASSWORD`, `ZERNIO_WEBHOOK_SECRET`, keys. The owner's number is `ALERT_PHONE` / `ADMIN_PHONES` (env only, never in code).
 - ElevenLabs: pay-as-you-go plan, both voice ids in env (`ELEVENLABS_DEFAULT_VOICE_ID`, `ELEVENLABS_SECONDARY_VOICE_ID`); ~13 k characters were left until 14 Sep at last check.
 - R2: a shared bucket with a public host; 75 sticker objects (~8 MB) after migration.
-- Sticker library: 75 captioned stickers (20 animated), all recovered/migrated; 0 broken captions.
-- Verified in production: health, auth (Bearer + Basic), signed Zernio webhook, groups sync, live message storage, summaries, Q&A over 14 k messages, transcription path, import via API, alert delivery (free text), retention dry run, voice notes to the owner's number (both voices), sticker send (base64 and library), wamid dedupe replay, R2 put/get, sticker migration.
+- Sticker library: 101 captioned stickers (21 animated), all in R2; 0 broken captions. Stickers table 80 kB, whole DB ≈ 15 MB.
+- Quotas in force: 3 `/resumen`, 20 assistant requests, 3 assistant audios per user per day (admins exempt).
+- Code: `main` on GitHub (public, MIT); `MEMO.private.md` (git-ignored) has the real numbers/ids.
+- Verified in production: health, auth (Bearer + Basic), signed Zernio webhook, groups sync, live message storage, summaries, Q&A over 14 k messages, transcription path, import via API, alert delivery (free text), retention dry run, voice notes to the owner's number (both voices), sticker send (base64 and library), wamid dedupe replay, R2 put/get, sticker migration, assistant tool selection (unit test against Gemini; the full in-group path is exercised by users).
 
 ## 5. Known gaps / next steps
 
@@ -86,7 +93,8 @@ Rules: unknown period arguments are rejected with usage help (no guessing); 15 s
 - The R2 bucket has a public endpoint configured, so objects are reachable by exact key (unguessable hashes/ids). Leave `CLOUDFLARE_S3_API_PUBLIC_ENDPOINT` empty to switch to presigned URLs.
 - Some sticker captions quote crude text printed on the sticker itself; `/sticker` replies can surface them in the group.
 - Not in git yet: `git init` + GitHub + Railway auto-deploy recommended.
-- Suggested later: group allowlist, scheduled daily digests, unit tests for the parsers, migrate `railway.json` to `.railway/railway.ts` before 2026-12-01.
+- Backlog lives in `TODO.md` (scheduler, expenses, reminders, action items, lists, scheduled digest, welcome brief, events, stats, links library). Also: group allowlist, unit tests for the parsers, migrate `railway.json` to `.railway/railway.ts` before 2026-12-01.
+- Assistant mode: the model sometimes emits English period words (e.g. `since: "yesterday"`), which the parser accepts; exotic phrasings fall back to the read mark or a usage hint.
 - Baileys is unofficial (ToS/ban risk): keep volume human-like, reply only to inbound, never run two instances with the same session.
 
 ## 6. Where things are
@@ -99,5 +107,6 @@ src/lib/store.ts           persistence helpers                  src/lib/zernio/c
 src/lib/maintenance.ts     retention + archive                  src/lib/alerts.ts, src/lib/import/* (chat export + sticker backfill)
 src/lib/ai/tts.ts          ElevenLabs voice notes               src/lib/ai/vision.ts    sticker/photo captions, sticker picker
 src/lib/storage/r2.ts      Cloudflare R2 client                 src/lib/whatsapp/sticker.ts  image → WebP sticker
+src/lib/bot/assistant.ts   @mention assistant (Gemini tools)    TODO.md                 feature backlog (research-based)
 src/app/api/**             all endpoints (GET /api lists them)  README.md               setup, commands, API, deploy, logs
 ```
