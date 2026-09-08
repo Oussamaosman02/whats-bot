@@ -52,7 +52,7 @@ Everything is exposed as a REST API as well (`GET /api` lists every endpoint), p
 | `/importar <grupo>` (admins, hidden) | attach a chat export to add history |
 | `/voz <texto>` (admins, hidden) | the bot says it as a voice note |
 
-Limits: 15 s cooldown, 3 `/resumen` per user per day, 20 assistant requests and 5 assistant audios per user per day (all exempt for `ADMIN_PHONES`), unknown periods are refused with examples instead of guessed. Spanish by default (`BOT_LANGUAGE`), times in `BOT_TIMEZONE`.
+Limits: 15 s cooldown, 3 `/resumen` per user per day, 20 assistant requests and 3 assistant audios per user per day (all exempt for `ADMIN_PHONES`), unknown periods are refused with examples instead of guessed. Spanish by default (`BOT_LANGUAGE`), times in `BOT_TIMEZONE`.
 
 ## How it works
 
