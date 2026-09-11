@@ -22,7 +22,8 @@ Grounded in what people ask for on X/Twitter and Reddit (research done 2026-09-0
 ## Tier 1 — high demand, fits the current stack
 
 - [ ] **Expense splitting in the group.** `/gasto 40 cena @ana @luis` · `/gastos` · `/saldos` · `/liquidar @ana`. Evidence: Splitwala bot (209 upvotes on r/IndiaTech), tweet "why doesn't WhatsApp build Splitwise in". Table `expenses` (chat, payer, amount, currency, participants[], note, ts). No AI needed; optionally let Gemini parse free text ("pagué 40 de la cena por todos").
-- [ ] **Reminders, next steps.** Assistant tool (`@bot recuérdame mañana a las 9 …`) reusing `parseWhen`; Gemini fallback for phrasings the parser rejects; "remind @ana by DM" (deliver to the mentioned person instead of the group).
+- [x] **Assistant reminders + voice-note requests** (2026-09-11): tools `create_reminder`, `list_reminders`, `cancel_reminder`, `list_pending_items`; a mention that replies to a voice note takes the transcript as the request (transcribing on demand if needed).
+- [ ] **Reminders, next steps.** Gemini fallback for phrasings `parseWhen` rejects; "remind @ana by DM" (deliver to the mentioned person instead of the group).
 - [ ] **Tasks table.** Persist `/pendientes` items with done/undone and `/hecho <n>`, so nagging can be automatic ("nudge after 2 days" → a reminder job per open task).
 - [ ] **Shared lists.** `/lista compra` · `/añadir leche, pan` · `/quitar 2` · `/lista` re-posts it · `/lista cerrar`. Evidence: r/AppIdeas thread (shopping lists, items everyone needs to bring). Table `lists` + `list_items` (chat, name, item, addedBy, done).
 

@@ -17,9 +17,11 @@ import { pickStickerReply } from "../ai/vision";
 import { whatsapp } from "../whatsapp/client";
 import type { NormalizedMessage } from "../whatsapp/types";
 import { fmtZoned } from "./since";
-import { runQuestion, runSummary } from "./service";
+import { runActionItems, runQuestion, runSummary } from "./service";
 import { socialCapabilities, socialLookup, type SocialItem, type SocialKind } from "../social";
 import { bumpUsage, countStickers, findMessageByWaId, getSticker, getStickerBytes, getUsage, lastMessages, listStickers, randomSticker, setMessageTranscript, setReadMark } from "../store";
+import { cancelJob, countPendingByUser, createJob, getJob, listJobs } from "./jobs";
+import { parseWhen, WHEN_HELP } from "./when";
 
 const log = getLogger("assistant");
 
@@ -70,6 +72,45 @@ const TOOLS: ToolDef[] = [
       name: "transcribe_quoted",
       description: "Transcribe the voice note the user is replying to and send the text. Only works when the user's message quotes a voice note.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_reminder",
+      description: "Schedule a reminder in this group: at the given time the bot posts the text mentioning the member (e.g. 'recuérdame mañana comprar pan', 'avísanos el lunes a las 20:00 de la reunión', 'cada día a las 9 vitaminas'). Use it whenever the member asks to be reminded / warned / told something later.",
+      parameters: {
+        type: "object",
+        properties: {
+          when: { type: "string", description: "When, in the bot's syntax (Spanish): 'mañana 9:00', 'hoy 18:00', 'el lunes a las 20:00', 'en 2h', 'en 30 min', '08/09 10:30', 'cada día a las 9:00', 'cada lunes 20:00', 'mañana por la tarde'. If the member gave no time of day, use 09:00." },
+          text: { type: "string", description: "What to remind, short, in the member's words (e.g. 'comprar pan')." },
+        },
+        required: ["when", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_reminders",
+      description: "List the pending reminders and scheduled messages of this group (returns data; answer with a short list). Use also before cancelling one.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cancel_reminder",
+      description: "Cancel a pending reminder by its id (from list_reminders). Only the member who created it (or an admin) can.",
+      parameters: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_pending_items",
+      description: "Extract what is still open in the chat – tasks, promises, unanswered questions, money owed – from the stored history and send it to the group ('qué tenemos pendiente', 'qué me toca a mí').",
+      parameters: { type: "object", properties: { since: { type: "string", description: "Period like '7d', '2d', 'hoy'. Default 7d." }, mine: { type: "boolean", description: "true when the member only wants what concerns them." } } },
     },
   },
   {
@@ -194,8 +235,28 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
   };
   const AUDIO_QUOTA_MSG = `audio quota reached: this user already got ${e.ASSISTANT_AUDIO_DAILY_LIMIT} audios today; tell them briefly (in their language) that the daily audio limit is ${e.ASSISTANT_AUDIO_DAILY_LIMIT} and offer the text version instead`;
   const alog = log.child({ reqId: opts.reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid });
-  const cleaned = (m.text ?? "").replace(new RegExp(`@${opts.botPhone ?? "0000"}\\b`, "g"), "").replace(/@\S+/g, (x) => (x.toLowerCase().includes(e.BOT_NAME.toLowerCase()) ? "" : x)).trim();
-  if (!cleaned) {
+  let cleaned = (m.text ?? "").replace(new RegExp(`@${opts.botPhone ?? "0000"}\\b`, "g"), "").replace(/@\S+/g, (x) => (x.toLowerCase().includes(e.BOT_NAME.toLowerCase()) ? "" : x)).trim();
+
+  // Replying to a voice note: what was SAID in it is (part of) the request – "recuérdame mañana comprar pan" 🎤 + "@bot"
+  let spokenRequest: string | undefined;
+  const quoted = m.quoted?.id ? await findMessageByWaId(m.chatJid, m.quoted.id) : undefined;
+  if (quoted?.type === "audio") {
+    let transcript = quoted.media?.transcript as string | undefined;
+    if (!transcript) {
+      try {
+        const media = await whatsapp.getMediaBuffer(m.chatJid, quoted.waId);
+        if (media) {
+          const t = await transcribeAudio(media.buffer, { mimetype: media.mimetype ?? (quoted.media?.mimetype as string | undefined), reqId: opts.reqId });
+          transcript = t.transcript;
+          await setMessageTranscript(m.chatJid, quoted.waId, t.transcript, { model: t.model, ms: t.ms });
+        }
+      } catch (err) {
+        alog.warn({ err: errInfo(err), hint: "Quoted voice note could not be transcribed; continuing with the text only." }, "assistant: quoted audio transcription failed");
+      }
+    }
+    if (transcript && transcript !== "[inaudible]") spokenRequest = transcript;
+  }
+  if (!cleaned && !spokenRequest) {
     await opts.reply(`¿Sí? Dime qué necesitas 🙂 (por ejemplo: "@${e.BOT_NAME} resume desde ayer", "haz un audio diciendo…", "manda un sticker de risa", "qué dice midudev en Twitter", "busca un vídeo sobre…")`);
     return;
   }
@@ -204,12 +265,19 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
   const recent = await lastMessages(m.chatJid, e.ASSISTANT_CONTEXT_MESSAGES, { excludeCommands: true });
   const tz = e.BOT_TIMEZONE;
   const ctx = recent.map((r) => `[${fmtZoned(r.timestamp, tz)}] ${r.fromMe ? e.BOT_NAME : r.senderName ?? r.senderPhone ?? "?"}: ${r.text ?? `[${r.type}]`}`).join("\n");
-  const quoted = m.quoted?.id ? await findMessageByWaId(m.chatJid, m.quoted.id) : undefined;
-  const quotedLine = quoted ? `\nThe user is replying to this message: [${fmtZoned(quoted.timestamp, tz)}] ${quoted.senderName ?? "?"}: ${quoted.text ?? `[${quoted.type}]`}` : m.quoted ? `\nThe user is replying to a message (${m.quoted.text ?? "no text"}).` : "";
+  const ownAudio = quoted && spokenRequest && (quoted.senderJid === m.senderJid || (quoted.senderPhone && quoted.senderPhone === m.senderPhone));
+  const quotedLine = spokenRequest
+    ? `\nThe member is replying to ${ownAudio ? "their OWN" : `${quoted?.senderName ?? "someone"}'s`} voice note, which says: "${spokenRequest}". ${ownAudio ? "Treat what the voice note says as the member's request (e.g. a reminder to create, a question, a summary to make) and DO it; the text of the mention, if any, only adds to it." : "The mention refers to that voice note (e.g. transcribe it, answer it, act on it)."}`
+    : quoted
+      ? `\nThe user is replying to this message: [${fmtZoned(quoted.timestamp, tz)}] ${quoted.senderName ?? "?"}: ${quoted.text ?? `[${quoted.type}]`}`
+      : m.quoted
+        ? `\nThe user is replying to a message (${m.quoted.text ?? "no text"}).`
+        : "";
+  if (!cleaned) cleaned = "(no text – see the voice note above)";
 
   const system = `You are ${e.BOT_NAME}, an assistant living inside the WhatsApp group "${m.chatName ?? m.chatJid}". A member just mentioned you.
 - Reply in the language the member used (default Spanish), friendly, brief, WhatsApp style (*bold*, "-" bullets, no # headers, few emojis).
-- Use a tool when the request matches one (summaries, questions about what happened in the chat, voice notes, stickers, transcription, read mark). Tools SEND their output to the group themselves; after a tool ran, answer with ONE short sentence or nothing at all (empty string) – never repeat the content the tool sent.
+- Use a tool when the request matches one (summaries, questions about what happened in the chat, voice notes, stickers, transcription, reminders, pending items, read mark). "Recuérdame / avísame / que no se me olvide …" ALWAYS means create_reminder. Tools SEND their output to the group themselves; after a tool ran, answer with ONE short sentence or nothing at all (empty string) – never repeat the content the tool sent.
 - For general questions, chit-chat, jokes, translations, ideas etc. just answer directly in text (no tool). If asked to speak/say something aloud, use send_voice_note with the exact words.
 ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name).join(", ")}) RETURN data to you and send nothing: use them whenever the answer depends on the outside world or on current facts – who someone is, what someone tweeted/published, videos or posts about a topic, news, prices, results, dates, or when a member shares a link and wants it explained/summarised. Pick the platform the member names (Twitter/X → search_tweets or user_tweets, YouTube → search_youtube / youtube_transcript, TikTok → search_tiktok, a URL → read_url, otherwise web_search). If the chat context mentions the subject too, you may combine answer_from_history with a lookup. Then answer in text with the key points and 1-3 plain URLs (no markdown links). If a lookup fails or returns nothing, say so briefly and answer with what you know.` : ""}
 - You can chain tools when needed (e.g. summarise AND send a sticker, web_search THEN read_url).
@@ -318,6 +386,40 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
         await opts.reply(`🎤 *${q.senderName ?? "Nota de voz"}:*\n${text}`);
         sentSomething = true;
         return { ok: true, sent: true, info: "transcript sent" };
+      }
+      case "create_reminder": {
+        if (!requester) return { ok: false, info: "unknown requester" };
+        const whenText = String(args.when ?? "").trim();
+        const text = String(args.text ?? "").trim();
+        if (!whenText || !text) return { ok: false, info: "when and text are required" };
+        const when = parseWhen(whenText, { timeZone: tz });
+        if ("error" in when) return { ok: false, info: `cannot parse when="${whenText}" (${when.error}); ask the member for a clearer time. Accepted forms: ${WHEN_HELP}` };
+        if (!opts.isAdmin && (await countPendingByUser(requester)) >= e.JOBS_MAX_PENDING_PER_USER) return { ok: false, info: `this member already has ${e.JOBS_MAX_PENDING_PER_USER} pending reminders; tell them to cancel one first` };
+        const job = await createJob({ kind: "reminder", chatJid: m.chatJid, originJid: m.chatJid, text: [text, when.rest].filter(Boolean).join(" ").trim(), mentions: [], dueAt: when.at, recurrence: when.recurrence, createdBy: requester, createdByName: m.senderName ?? m.senderPhone });
+        return { ok: true, info: `reminder #${job.id} created: ${when.label} → "${job.text}". Confirm in one short sentence with the day and time (${fmtZoned(job.dueAt, tz)}${when.recurrence ? ", recurring" : ""}).` };
+      }
+      case "list_reminders": {
+        const rows = await listJobs({ chatJid: m.chatJid, status: ["pending"], limit: 20 });
+        return { ok: true, info: rows.length ? `${rows.length} pending; answer with a short list (id · when · text)` : "nothing pending in this group", data: rows.map((j) => ({ id: j.id, when: fmtZoned(j.dueAt, tz), text: j.text, by: j.createdByName, recurring: Boolean(j.recurrence), kind: j.kind })) };
+      }
+      case "cancel_reminder": {
+        const id = Number(args.id);
+        const job = Number.isInteger(id) ? await getJob(id) : undefined;
+        if (!job || job.chatJid !== m.chatJid) return { ok: false, info: `no reminder #${args.id} in this group` };
+        if (!opts.isAdmin && job.createdBy !== requester) return { ok: false, info: "only its creator or an admin can cancel it" };
+        const c = await cancelJob(job.id);
+        return c ? { ok: true, info: `reminder #${job.id} cancelled ("${job.text}")` } : { ok: false, info: `reminder #${job.id} is ${job.status}, not pending` };
+      }
+      case "list_pending_items": {
+        try {
+          const mine = Boolean(args.mine);
+          const res = await runActionItems({ chatJid: m.chatJid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, requesterJid: requester, requesterPhone: m.senderPhone, forName: mine ? (m.senderName ?? m.senderPhone) : undefined, forPhone: mine ? m.senderPhone : undefined, reqId: opts.reqId });
+          await opts.reply(`📋 *Pendientes${mine ? " tuyos" : ""}* – ${res.label}\n\n${res.text}`);
+          sentSomething = true;
+          return { ok: true, sent: true, info: `pending items sent (${res.messageCount} messages read)` };
+        } catch (err) {
+          return { ok: false, info: isAppError(err) ? `${err.message} ${err.hint ?? ""}` : errInfo(err).message };
+        }
       }
       case "set_read_mark": {
         if (!requester) return { ok: false, info: "unknown requester" };
