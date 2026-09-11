@@ -7,6 +7,7 @@ import { whatsapp } from "@/lib/whatsapp/client";
 import { metaCloud } from "@/lib/meta/cloud";
 import { ttsStatus } from "@/lib/ai/tts";
 import { r2 } from "@/lib/storage/r2";
+import { socialCapabilities } from "@/lib/social";
 
 /**
  * Deep health check. Each subsystem reports ok/error/hint so a failing deploy explains itself.
@@ -37,6 +38,7 @@ export const GET = route(async ({ req, query, log }) => {
     zernio: zer,
     r2: deep ? await r2.ping() : { ok: true, skipped: true },
     tts: deep ? await ttsStatus().catch((e) => ({ ok: false, error: String(e) })) : { ok: true, skipped: true },
+    social: { ok: env().SOCIAL_SEARCH_ENABLED, capabilities: socialCapabilities(), hint: env().SOCIAL_SEARCH_ENABLED ? undefined : "SOCIAL_SEARCH_ENABLED=false – the assistant cannot search X/YouTube/web." },
     metaCloud: { ok: metaCloud.enabled(), configured: metaCloud.enabled(), hint: metaCloud.enabled() ? undefined : "Optional. Set META_ACCESS_TOKEN + META_PHONE_NUMBER_ID for the official Groups API (Path A)." },
   };
   const status = db.ok ? 200 : 503;

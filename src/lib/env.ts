@@ -107,6 +107,31 @@ const schema = z.object({
   IMPORT_MAX_MB: z.coerce.number().default(200),
   IMPORT_DATE_FORMAT: z.enum(["auto", "dmy", "mdy"]).default("auto"),
 
+  /** Social / web lookups for the assistant ("superpowers"): X/Twitter, YouTube, TikTok, Google, read a page */
+  SOCIAL_SEARCH_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v !== "false" && v !== "0"),
+  /** lookups (any kind) a user can trigger through the assistant per day; ADMIN_PHONES exempt */
+  SOCIAL_DAILY_LIMIT: z.coerce.number().default(15),
+  /** identical (kind, query) within this window is served from social_lookups instead of the provider */
+  SOCIAL_CACHE_MINUTES: z.coerce.number().default(30),
+  /** ISO-3166 alpha-2 country used to localise web / YouTube / TikTok searches */
+  SOCIAL_COUNTRY: z.string().default("es"),
+  /** monid.ai — many data providers (context.dev web search/scrape, TikHub…) behind one /run endpoint */
+  MONID_API_KEY: optionalString,
+  MONID_BASE_URL: z.string().default("https://api.monid.ai/v1"),
+  /** treg.to — ~2,600 catalogued endpoints (X, YouTube, Google SERP, TikHub…) behind one proxy */
+  TREG_TOKEN: optionalString,
+  TREG_BASE_URL: z.string().default("https://treg.to"),
+  TREG_ORG: optionalString,
+  /** transcriptapi.com — YouTube search (free) + transcripts (1 credit each) */
+  TRANSCRIPTAPI_API_KEY: optionalString,
+  TRANSCRIPTAPI_BASE_URL: z.string().default("https://transcriptapi.com/api/v2"),
+  /** twitterapi.io — tweet search & user timelines (header x-api-key) */
+  TWITTERAPI_IO_API_KEY: optionalString,
+  TWITTERAPI_IO_BASE_URL: z.string().default("https://api.twitterapi.io"),
+
   META_ACCESS_TOKEN: optionalString,
   META_PHONE_NUMBER_ID: optionalString,
   META_VERIFY_TOKEN: optionalString,
@@ -146,5 +171,15 @@ export function features() {
     zernio: Boolean(e.ZERNIO_API_KEY),
     metaCloud: Boolean(e.META_ACCESS_TOKEN && e.META_PHONE_NUMBER_ID),
     apiAuth: Boolean(e.API_KEY),
+    /** assistant search "superpowers" – each capability lists which provider serves it (direct key first, treg/monid as fallback) */
+    social: {
+      enabled: e.SOCIAL_SEARCH_ENABLED,
+      twitter: Boolean(e.TWITTERAPI_IO_API_KEY || e.TREG_TOKEN),
+      youtube: Boolean(e.TRANSCRIPTAPI_API_KEY || e.TREG_TOKEN),
+      web: Boolean(e.MONID_API_KEY || e.TREG_TOKEN),
+      tiktok: Boolean(e.MONID_API_KEY || e.TREG_TOKEN),
+      monid: Boolean(e.MONID_API_KEY),
+      treg: Boolean(e.TREG_TOKEN),
+    },
   };
 }

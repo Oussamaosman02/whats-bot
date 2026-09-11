@@ -5,7 +5,7 @@
 import { and, desc, eq, gt, gte, lt, lte, ne, sql as dsql, inArray } from "drizzle-orm";
 import { db, schema } from "./db";
 import type { NormalizedMessage } from "./whatsapp/types";
-import type { Message, MessageSource } from "./db/schema";
+import type { Message, MessageSource, SocialItem, SocialKind } from "./db/schema";
 import { getLogger } from "./logger";
 import { r2, r2Enabled } from "./storage/r2";
 
@@ -550,4 +550,79 @@ export async function randomSticker(exclude: string[] = []) {
 export async function countStickers() {
   const [r] = await db.select({ n: dsql<number>`count(*)::int` }).from(schema.stickers);
   return r?.n ?? 0;
+}
+
+// ── Social / web lookups (assistant superpowers) ─────────────────────────────
+
+/** Most recent successful lookup for this key newer than `since` (cache hit), or undefined. */
+export async function findRecentSocialLookup(queryKey: string, since: Date) {
+  const rows = await db
+    .select()
+    .from(schema.socialLookups)
+    .where(and(eq(schema.socialLookups.queryKey, queryKey), eq(schema.socialLookups.ok, true), eq(schema.socialLookups.cached, false), gte(schema.socialLookups.createdAt, since)))
+    .orderBy(desc(schema.socialLookups.createdAt))
+    .limit(1);
+  return rows[0];
+}
+
+export async function insertSocialLookup(input: {
+  kind: SocialKind;
+  query: string;
+  queryKey: string;
+  chatJid?: string;
+  requestedBy?: string;
+  requestedByName?: string;
+  provider?: string;
+  endpoint?: string;
+  ok: boolean;
+  error?: string;
+  results?: SocialItem[];
+  costUsd?: number;
+  latencyMs?: number;
+  cached?: boolean;
+}) {
+  const rows = await db
+    .insert(schema.socialLookups)
+    .values({
+      kind: input.kind,
+      query: input.query,
+      queryKey: input.queryKey,
+      chatJid: input.chatJid ?? null,
+      requestedBy: input.requestedBy ?? null,
+      requestedByName: input.requestedByName ?? null,
+      provider: input.provider ?? null,
+      endpoint: input.endpoint ?? null,
+      ok: input.ok,
+      error: input.error ?? null,
+      resultCount: input.results?.length ?? 0,
+      results: input.results ?? null,
+      costUsd: input.costUsd ?? 0,
+      latencyMs: input.latencyMs ?? null,
+      cached: input.cached ?? false,
+    })
+    .returning({ id: schema.socialLookups.id });
+  return rows[0]?.id;
+}
+
+/** Recent lookups (newest first) for GET /api/social. */
+export async function listSocialLookups(opts: { kind?: SocialKind; chatJid?: string; limit?: number; includeResults?: boolean } = {}) {
+  const conds = [] as ReturnType<typeof eq>[];
+  if (opts.kind) conds.push(eq(schema.socialLookups.kind, opts.kind));
+  if (opts.chatJid) conds.push(eq(schema.socialLookups.chatJid, opts.chatJid));
+  const rows = await db
+    .select()
+    .from(schema.socialLookups)
+    .where(conds.length ? and(...conds) : undefined)
+    .orderBy(desc(schema.socialLookups.createdAt))
+    .limit(opts.limit ?? 50);
+  return opts.includeResults ? rows : rows.map(({ results, ...r }) => ({ ...r, results: undefined, sample: results?.slice(0, 3).map((x) => x.title ?? x.text?.slice(0, 80) ?? x.url) }));
+}
+
+/** Spend + counts per kind (all time) for GET /api/social?stats=1. */
+export async function socialLookupStats() {
+  return db
+    .select({ kind: schema.socialLookups.kind, provider: schema.socialLookups.provider, lookups: dsql<number>`count(*)::int`, cached: dsql<number>`sum(case when ${schema.socialLookups.cached} then 1 else 0 end)::int`, failed: dsql<number>`sum(case when ${schema.socialLookups.ok} then 0 else 1 end)::int`, costUsd: dsql<number>`coalesce(sum(${schema.socialLookups.costUsd}), 0)::float` })
+    .from(schema.socialLookups)
+    .groupBy(schema.socialLookups.kind, schema.socialLookups.provider)
+    .orderBy(schema.socialLookups.kind);
 }

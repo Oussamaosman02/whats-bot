@@ -34,7 +34,7 @@ Grounded in what people ask for on X/Twitter and Reddit (research done 2026-09-0
 ## Tier 3 — niche or risky
 
 - [ ] **Anti-spam for large communities.** Detect join-and-spam, link floods, repeated forwards; DM the admins rather than auto-kick (auto-kicks raise the ban risk for a Baileys number). Evidence: 50k-member community mods on r/CommunityManager.
-- [ ] **Live lookups.** `/buscar <query>` with web search grounding: sports scores, weather, prices. Evidence: football-scores bot (45 upvotes). Keep answers short; never post unprompted.
+- [x] **Live lookups.** Shipped 2026-09-10 as assistant tools (web_search, read_url, search_tweets, user_tweets, search_youtube, youtube_transcript, search_tiktok) via monid/treg/twitterapi/transcriptapi; log + cache in `social_lookups`, `GET/POST /api/social`. Pending: a `/buscar` slash alias.
 - [ ] **Chat-pattern / relationship reports.** Went viral but privacy-sensitive; only from an explicit chat export sent by DM, never from group history. Probably skip.
 
 ## Cross-cutting

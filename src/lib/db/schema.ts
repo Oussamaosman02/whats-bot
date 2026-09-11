@@ -9,6 +9,8 @@
  *   read_marks       – per (chat, user) pointer of the last summary delivered
  *   webhook_events   – inbound webhook ids for idempotency
  *   settings         – key/value runtime settings (bot config, worker status…)
+ *   stickers         – sticker library (file in R2 + AI caption)
+ *   social_lookups   – every X/YouTube/TikTok/web lookup the assistant made (audit, cost, short-lived cache)
  *   baileys_auth     – Baileys credentials/keys so the worker is stateless
  */
 import {
@@ -19,6 +21,7 @@ import {
   timestamp,
   jsonb,
   serial,
+  doublePrecision,
   primaryKey,
   index,
   uniqueIndex,
@@ -174,6 +177,52 @@ export const usageCounters = pgTable(
   (t) => [primaryKey({ columns: [t.userJid, t.kind, t.day] })],
 );
 
+export type SocialKind = "tweets" | "user_tweets" | "youtube" | "youtube_transcript" | "web" | "url" | "tiktok";
+
+/** One provider-agnostic hit (tweet, video, page, search result…) as stored and as handed to Gemini. */
+export type SocialItem = {
+  id?: string;
+  title?: string;
+  text?: string;
+  url?: string;
+  author?: string;
+  /** ISO date or the provider's human label ("2 days ago") */
+  date?: string;
+  metrics?: Record<string, number>;
+};
+
+/**
+ * Social / web lookups made through the assistant or POST /api/social (like `stickers`, but for the outside world):
+ * what was asked, by whom, which provider answered, what it cost, and the folded results so an identical query
+ * within SOCIAL_CACHE_MINUTES is served from here instead of paying the provider again.
+ */
+export const socialLookups = pgTable(
+  "social_lookups",
+  {
+    id: serial("id").primaryKey(),
+    kind: text("kind").$type<SocialKind>().notNull(),
+    query: text("query").notNull(),
+    /** normalised `${kind}:${query}` used for cache hits */
+    queryKey: text("query_key").notNull(),
+    chatJid: text("chat_jid"),
+    requestedBy: text("requested_by"),
+    requestedByName: text("requested_by_name"),
+    /** twitterapi | transcriptapi | monid | treg | fetch | cache */
+    provider: text("provider"),
+    endpoint: text("endpoint"),
+    ok: boolean("ok").notNull().default(true),
+    error: text("error"),
+    resultCount: integer("result_count").notNull().default(0),
+    results: jsonb("results").$type<SocialItem[]>(),
+    costUsd: doublePrecision("cost_usd").notNull().default(0),
+    latencyMs: integer("latency_ms"),
+    /** true when served from an earlier row instead of the provider */
+    cached: boolean("cached").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("social_lookups_key_idx").on(t.queryKey, t.createdAt), index("social_lookups_chat_idx").on(t.chatJid, t.createdAt)],
+);
+
 export const baileysAuth = pgTable("baileys_auth", {
   id: text("id").primaryKey(),
   data: text("data").notNull(), // BufferJSON-encoded
@@ -184,3 +233,4 @@ export type Chat = typeof chats.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type NewMessage = typeof messages.$inferInsert;
 export type Summary = typeof summaries.$inferSelect;
+export type SocialLookup = typeof socialLookups.$inferSelect;

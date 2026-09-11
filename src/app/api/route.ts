@@ -43,6 +43,7 @@ export const GET = route(async () => {
       ],
       ai: ["GET /api/ai/models", "POST /api/ai/summarize {chatJid, since?, style?, focus?, language?, model?}", "POST /api/ai/ask {chatJid, question, since?}", "POST /api/ai/reply {chatJid, instruction?, send?}"],
       summaries: ["GET /api/summaries?chat=&limit=", "GET /api/summaries/:id"],
+      social: ["GET /api/social?kind=&chat=&limit=&results=1 (lookup log)", "GET /api/social?stats=1 (spend per kind/provider)", "POST /api/social {kind: tweets|user_tweets|youtube|youtube_transcript|web|url|tiktok, query, limit?, latest?, force?}"],
       zernio: [
         "POST /api/webhooks/zernio (Zernio → us)",
         "GET /api/zernio/accounts",

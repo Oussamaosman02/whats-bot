@@ -15,6 +15,7 @@ Built as an API-only Next.js app that runs on one small server (Railway), uses G
 | Feature | How |
 |---|---|
 | **Assistant mode** | Mention the bot in a group (`@ResumenBot haz un audio diciendo feliz cumple Luis`, `@ResumenBot resume desde ayer en audio`, `@ResumenBot manda un sticker de risa`, `@ResumenBot ¿qué opinas de…?`) and Gemini decides what to do with tools: summarise, answer from history, create a voice note (secondary voice), send a sticker, transcribe, or just chat. Groups only; replying to the bot does not trigger it. |
+| **Superpowers (lookups)** | In assistant mode the bot can also look outside the chat: `@ResumenBot qué dice midudev en Twitter`, `@ResumenBot busca un vídeo sobre Next 16 y resúmelo`, `@ResumenBot explícale a Pau quién es midudev`, `@ResumenBot qué dice este enlace` (reply to a link). Tools: X/Twitter search + user timelines (twitterapi.io, treg fallback), YouTube search + transcripts (transcriptapi.com, treg fallback), web search + read any URL (monid.ai → context.dev, treg Google SERP fallback), TikTok search (TikHub via monid/treg). Every lookup is logged with provider, cost and results in `social_lookups` (`GET /api/social`), cached for `SOCIAL_CACHE_MINUTES`, and capped at `SOCIAL_DAILY_LIMIT` per user per day. |
 | **Catch-up summaries** | `/resumen` in the group → Gemini summary since your last summary, your last message, a day, or a date + time. Delivered in the group or by DM. |
 | **Ask the chat** | `/preguntar ¿qué se decidió de la cena?` → searches the whole stored history (keywords + recent context + archived summaries) and answers. |
 | **Voice notes in** | Every voice note is transcribed (Gemini audio) and becomes part of summaries. Reply to one with `/transcribir` to read it, or `/transcribir breve` for a TL;DR of a long one (the bot offers it itself past 60 s). |
@@ -52,7 +53,7 @@ Everything is exposed as a REST API as well (`GET /api` lists every endpoint), p
 | `/importar <grupo>` (admins, hidden) | attach a chat export to add history |
 | `/voz <texto>` (admins, hidden) | the bot says it as a voice note |
 
-Limits: 15 s cooldown, 3 `/resumen` per user per day, 20 assistant requests and 3 assistant audios per user per day (all exempt for `ADMIN_PHONES`), unknown periods are refused with examples instead of guessed. Spanish by default (`BOT_LANGUAGE`), times in `BOT_TIMEZONE`.
+Limits: 15 s cooldown, 3 `/resumen` per user per day, 20 assistant requests, 3 assistant audios and 15 external lookups per user per day (all exempt for `ADMIN_PHONES`), unknown periods are refused with examples instead of guessed. Spanish by default (`BOT_LANGUAGE`), times in `BOT_TIMEZONE`.
 
 ## How it works
 
