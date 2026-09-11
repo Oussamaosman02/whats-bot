@@ -11,6 +11,8 @@
  *   settings         – key/value runtime settings (bot config, worker status…)
  *   stickers         – sticker library (file in R2 + AI caption)
  *   social_lookups   – every X/YouTube/TikTok/web lookup the assistant made (audit, cost, short-lived cache)
+ *   digests          – scheduled group bulletins ("breaking news"): fixed local hours, text or voice note
+ *   jobs             – one-off / recurring scheduled messages and reminders (claimed atomically by the scheduler)
  *   baileys_auth     – Baileys credentials/keys so the worker is stateless
  */
 import {
@@ -27,6 +29,13 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 
+/** Per-group bot settings (set with /bienvenida, /config or PATCH /api/groups/:jid {settings}). */
+export type GroupSettings = {
+  /** DM newcomers a summary of the last `welcomeDays` days (default off) */
+  welcomeBrief?: boolean;
+  welcomeDays?: number;
+};
+
 export const chats = pgTable("chats", {
   jid: text("jid").primaryKey(),
   kind: text("kind").$type<"group" | "dm">().notNull(),
@@ -35,6 +44,8 @@ export const chats = pgTable("chats", {
   participantCount: integer("participant_count"),
   description: text("description"),
   metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+  /** bot settings for this chat – separate from `metadata` (which WhatsApp group syncs overwrite) */
+  settings: jsonb("settings").$type<GroupSettings>(),
   lastMessageAt: timestamp("last_message_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -223,6 +234,74 @@ export const socialLookups = pgTable(
   (t) => [index("social_lookups_key_idx").on(t.queryKey, t.createdAt), index("social_lookups_chat_idx").on(t.chatJid, t.createdAt)],
 );
 
+export type DigestStyle = "brief" | "bullets" | "detailed";
+
+/**
+ * Scheduled digest per group: at each hour in `hours` (HH:MM, BOT_TIMEZONE) the bot posts a summary of what was said
+ * since the previous run – as a voice note when `audio` is set. One row per group; the in-process scheduler
+ * (src/lib/bot/digest.ts) claims a row by advancing `nextRunAt` atomically, so a restart never double-posts.
+ */
+export const digests = pgTable(
+  "digests",
+  {
+    id: serial("id").primaryKey(),
+    chatJid: text("chat_jid").notNull().unique(),
+    /** local wall-clock times, sorted, e.g. ["06:00","14:00","22:00"] */
+    hours: jsonb("hours").$type<string[]>().notNull(),
+    audio: boolean("audio").notNull().default(true),
+    style: text("style").$type<DigestStyle>().notNull().default("bullets"),
+    enabled: boolean("enabled").notNull().default(true),
+    /** fewer stored messages than this since the last run → the slot is skipped silently */
+    minMessages: integer("min_messages").notNull().default(5),
+    createdBy: text("created_by"),
+    createdByName: text("created_by_name"),
+    /** start of the window of the next digest (set when a slot is claimed) */
+    lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    /** last time a digest was actually posted */
+    lastSentAt: timestamp("last_sent_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    nextRunAt: timestamp("next_run_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("digests_next_run_idx").on(t.enabled, t.nextRunAt)],
+);
+
+export type JobKind = "message" | "reminder";
+export type JobStatus = "pending" | "running" | "done" | "cancelled" | "failed" | "missed";
+export type Recurrence = { kind: "daily" } | { kind: "weekdays" } | { kind: "weekly"; weekday: number } | { kind: "interval"; ms: number };
+
+/**
+ * Scheduled messages (`/programar`, posted as the bot) and reminders (`/recordar`, mention the author).
+ * `dueAt` is the next fire time; recurring jobs go back to `pending` with a new `dueAt` after each run.
+ * Claimed with `UPDATE … WHERE status = 'pending'` so two processes never send the same job.
+ */
+export const jobs = pgTable(
+  "jobs",
+  {
+    id: serial("id").primaryKey(),
+    kind: text("kind").$type<JobKind>().notNull(),
+    /** where it is delivered: a group jid or a user jid (DM) */
+    chatJid: text("chat_jid").notNull(),
+    /** where the command was typed (DM vs group) – for listing */
+    originJid: text("origin_jid"),
+    text: text("text").notNull(),
+    mentions: jsonb("mentions").$type<string[]>(),
+    dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+    recurrence: jsonb("recurrence").$type<Recurrence>(),
+    status: text("status").$type<JobStatus>().notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    runs: integer("runs").notNull().default(0),
+    lastError: text("last_error"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    createdBy: text("created_by"),
+    createdByName: text("created_by_name"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("jobs_due_idx").on(t.status, t.dueAt), index("jobs_chat_idx").on(t.chatJid, t.status), index("jobs_creator_idx").on(t.createdBy, t.status)],
+);
+
 export const baileysAuth = pgTable("baileys_auth", {
   id: text("id").primaryKey(),
   data: text("data").notNull(), // BufferJSON-encoded
@@ -234,3 +313,5 @@ export type Message = typeof messages.$inferSelect;
 export type NewMessage = typeof messages.$inferInsert;
 export type Summary = typeof summaries.$inferSelect;
 export type SocialLookup = typeof socialLookups.$inferSelect;
+export type Digest = typeof digests.$inferSelect;
+export type Job = typeof jobs.$inferSelect;

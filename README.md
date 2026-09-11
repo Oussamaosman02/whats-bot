@@ -16,6 +16,11 @@ Built as an API-only Next.js app that runs on one small server (Railway), uses G
 |---|---|
 | **Assistant mode** | Mention the bot in a group (`@ResumenBot haz un audio diciendo feliz cumple Luis`, `@ResumenBot resume desde ayer en audio`, `@ResumenBot manda un sticker de risa`, `@ResumenBot ¿qué opinas de…?`) and Gemini decides what to do with tools: summarise, answer from history, create a voice note (secondary voice), send a sticker, transcribe, or just chat. Groups only; replying to the bot does not trigger it. |
 | **Superpowers (lookups)** | In assistant mode the bot can also look outside the chat: `@ResumenBot qué dice midudev en Twitter`, `@ResumenBot busca un vídeo sobre Next 16 y resúmelo`, `@ResumenBot explícale a Pau quién es midudev`, `@ResumenBot qué dice este enlace` (reply to a link). Tools: X/Twitter search + user timelines (twitterapi.io, treg fallback), YouTube search + transcripts (transcriptapi.com, treg fallback), web search + read any URL (monid.ai → context.dev, treg Google SERP fallback), TikTok search (TikHub via monid/treg). Every lookup is logged with provider, cost and results in `social_lookups` (`GET /api/social`), cached for `SOCIAL_CACHE_MINUTES`, and capped at `SOCIAL_DAILY_LIMIT` per user per day. |
+| **Scheduled bulletins ("breaking news")** | `/boletin 06:00 14:00 22:00 audio` (group admins) → at those hours the bot posts a radio-style voice note with everything said since the previous one; `/boletin cada 8h desde 06:00`, `… texto` for a written digest. Nothing is posted when fewer than 5 new messages (`DIGEST_MIN_MESSAGES`). State lives in Postgres (`digests`), an in-process scheduler claims each slot atomically, so restarts never double-post; slots missed while the server was down are skipped, not posted late. |
+| **Reminders & scheduled messages** | `/recordar mañana 9:00 llevar el pastel` (also `el lunes 20:00`, `en 2h`, `cada día a las 9:00`, `cada lunes 20:00`; reply to a message with `/recordar mañana` to be reminded of it) → the bot mentions you in the group at that time, or DMs you if you asked by DM. Admins: `/programar el lunes 9:00 Recordad el DNI` posts as the bot. `/programados` · `/cancelar <nº>`. Jobs live in Postgres (`jobs`), claimed atomically, retried 3×, marked *missed* if the server was down for longer than `JOBS_MAX_LATE_MINUTES`. |
+| **Action items** | `/pendientes` → open tasks, promises ("lo mando el viernes"), unanswered questions and debts of the last 7 days (`/pendientes 2d`); `/pendientes míos` → only what concerns you. Same daily quota as `/resumen`. |
+| **Private morning brief** | By DM: `/boletin 8:00 privado` → every morning one message (or `… audio` voice note) with a short digest of *every* group you share with the bot. |
+| **Welcome brief** | `/bienvenida on` (admins) → whoever joins the group gets, by DM and never in the group, a summary of the last 3 days (`/bienvenida 7` for a week) plus the open items. |
 | **Catch-up summaries** | `/resumen` in the group → Gemini summary since your last summary, your last message, a day, or a date + time. Delivered in the group or by DM. |
 | **Ask the chat** | `/preguntar ¿qué se decidió de la cena?` → searches the whole stored history (keywords + recent context + archived summaries) and answers. |
 | **Voice notes in** | Every voice note is transcribed (Gemini audio) and becomes part of summaries. Reply to one with `/transcribir` to read it, or `/transcribir breve` for a TL;DR of a long one (the bot offers it itself past 60 s). |
@@ -44,12 +49,24 @@ Everything is exposed as a REST API as well (`GET /api` lists every endpoint), p
 | `/marcar` | "start counting from here" without summarising |
 | `/sticker` · `/sticker <word>` · reply with `/sticker` | random · search · best humorous reply (own message → random) · photo → sticker |
 | reply to a voice note with `/transcribir` · `/transcribir breve` | read it · just the gist (long voice notes) |
+| `/boletin` · `/boletin 06:00 14:00 22:00 audio` · `/boletin cada 8h desde 06:00` · `… texto` · `… breve`/`detallado` | see the scheduled bulletin · (admins) schedule it as voice notes · every N hours · as text · length |
+| `/boletin off` · `on` · `ahora` · `quitar` | pause · resume · post one now (preview) · remove |
+| `/recordar mañana 9:00 <texto>` · `el lunes 20:00` · `en 2h` · `cada día a las 9:00` · `cada lunes 20:00` · reply + `/recordar mañana` | reminder that mentions you at that time (recurring ones supported) |
+| `/programar <cuándo> <texto>` (admins) | the bot posts that text at that time |
+| `/programados` · `/cancelar <nº>` | pending reminders/messages of the group · cancel one (creator or admin) |
+| `/pendientes` · `/pendientes 2d` · `/pendientes míos` | open tasks, promises, questions, debts · period · only yours |
+| `/bienvenida` · `/bienvenida on` / `off` / `7` (admins) | welcome brief for newcomers by DM: status · enable · disable · days |
+| `/config` | the group's bot settings (bulletin, welcome, pending jobs, quotas) |
 | `/ayuda` · `/ping` · `/id` | help · liveness · ids |
 
 | By DM | |
 |---|---|
 | `/grupos` | groups you share with the bot |
-| `/resumen 2 ayer 15:00` · `/resumen Familia hoy` | summarise one of them privately |
+| `/resumen 2 ayer 15:00` · `/resumen Familia hoy` · `/resumen hoy` | summarise one of them privately (if you share only one group with the bot it is implied) |
+| `/boletin Familia 06:00 14:00 22:00 audio` · `/boletin 2 off` · `/boletin ahora` | configure a group's bulletin from your DM (group admins / `ADMIN_PHONES`; the group is implied when you share only one) |
+| `/boletin 8:00 privado` · `… audio` · `/boletin privado ahora` | your private morning brief of every shared group |
+| `/recordar en 2h llamar al médico` | reminder delivered to you by DM |
+| `/programar Familia mañana 9:00 <texto>` · `/pendientes Familia míos` · `/bienvenida Familia on` · `/config` | the same group commands, from your DM |
 | `/importar <grupo>` (admins, hidden) | attach a chat export to add history |
 | `/voz <texto>` (admins, hidden) | the bot says it as a voice note |
 
@@ -114,6 +131,8 @@ The Dockerfile builds a standalone Next.js server. Keep **one replica** (`railwa
 | `BOT_NAME` · `BOT_LANGUAGE` · `BOT_TIMEZONE` · `BOT_COMMAND_PREFIX` | identity | ResumenBot · es · Europe/Madrid · `/` |
 | `ADMIN_PHONES` · `ALERT_PHONE` | who can import / say; who gets outage alerts | – |
 | `DAILY_SUMMARY_LIMIT` · `SUMMARY_MAX_MESSAGES` | quotas | 3 · 1500 |
+| `DIGEST_ENABLED` · `DIGEST_MIN_MESSAGES` · `DIGEST_MAX_LATE_MINUTES` | scheduled bulletins: master switch, minimum new messages to post, skip slots found later than this after a restart | true · 5 · 90 |
+| `JOBS_MAX_LATE_MINUTES` · `JOBS_MAX_PENDING_PER_USER` · `WELCOME_BRIEF_DAYS` | reminders found later than this after a restart are marked missed · pending jobs per user · days covered by the welcome brief | 180 · 20 · 3 |
 | `RETENTION_DAYS` · `RETENTION_ARCHIVE` | delete after N days, archive first | 15 · true |
 | `TRANSCRIBE_AUDIO` · `DESCRIBE_MEDIA` | voice-note transcription, sticker/photo captions | true · true |
 | `ELEVENLABS_API_KEY` · `ELEVENLABS_DEFAULT_VOICE_ID` · `ELEVENLABS_SECONDARY_VOICE_ID` · `TTS_MAX_CHARS` | voice out | – / 2500 |
@@ -128,7 +147,8 @@ The Dockerfile builds a standalone Next.js server. Keep **one replica** (`railwa
 | Area | Endpoints |
 |---|---|
 | Health & link | `GET /api/health` · `GET /api/whatsapp/qr` · `GET /api/whatsapp/status` · `POST /api/whatsapp/{connect,disconnect,logout}` |
-| Groups | `GET/POST /api/groups` · `GET/PATCH/DELETE /api/groups/:jid` · participants, invite, join · `GET …/messages` · `POST …/summarize` · `POST …/ask` · `POST …/import` |
+| Groups | `GET/POST /api/groups` · `GET/PATCH/DELETE /api/groups/:jid` · participants, invite, join · `GET …/messages` · `POST …/summarize` · `POST …/ask` · `POST …/import` · `GET/PUT/DELETE/POST /api/groups/:jid/digest` (scheduled bulletin; POST posts one now) · `GET /api/digests` · `POST …/actions` (open items) · `PATCH /api/groups/:jid {settings: {welcomeBrief, welcomeDays}}` |
+| Jobs | `GET /api/jobs?chat=&status=` · `POST /api/jobs {chat, text, when: "mañana 9:00" \| dueAt, kind?, mentions?, recurrence?}` · `GET/DELETE /api/jobs/:id` · `POST /api/jobs/:id` (deliver now) |
 | Messages | `POST /api/messages` (text/media, routed to the right channel) · `POST /api/messages/voice` · `POST /api/messages/sticker` · `GET /api/messages/:id/media` · `POST /api/messages/:id/transcribe` (`brief` → adds a TL;DR) · `POST /api/messages/:id/react` |
 | Stickers | `GET /api/stickers?search=` · `GET /api/stickers/:sha256` |
 | AI | `GET /api/ai/models` · `POST /api/ai/{summarize,ask,reply}` · `GET /api/tts/status` |

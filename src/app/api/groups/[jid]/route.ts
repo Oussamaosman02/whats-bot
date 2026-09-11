@@ -1,7 +1,7 @@
 import { route, ok, z } from "@/lib/api";
 import { AppError } from "@/lib/errors";
 import { whatsapp } from "@/lib/whatsapp/client";
-import { getChat, listParticipants } from "@/lib/store";
+import { getChat, listParticipants, setGroupSettings } from "@/lib/store";
 
 type P = { jid: string };
 
@@ -18,11 +18,26 @@ export const GET = route<P>(async ({ params, query }) => {
   return ok({ ...chat, participants });
 });
 
+/**
+ * PATCH /api/groups/:jid {subject?, description?, setting?} → WhatsApp group update;
+ * {settings: {welcomeBrief?, welcomeDays?}} → bot settings for this group (stored, no WhatsApp call).
+ */
 export const PATCH = route<P>(async ({ params, body }) => {
   const jid = decodeURIComponent(params.jid);
-  const patch = await body(z.object({ subject: z.string().max(100).optional(), description: z.string().max(2048).optional(), setting: z.enum(["announcement", "not_announcement", "locked", "unlocked"]).optional() }).refine((v) => Object.keys(v).length > 0, "Provide subject, description or setting"));
+  const { settings, ...patch } = await body(
+    z
+      .object({
+        subject: z.string().max(100).optional(),
+        description: z.string().max(2048).optional(),
+        setting: z.enum(["announcement", "not_announcement", "locked", "unlocked"]).optional(),
+        settings: z.object({ welcomeBrief: z.boolean().optional(), welcomeDays: z.number().int().min(1).max(30).optional() }).optional(),
+      })
+      .refine((v) => Object.keys(v).length > 0, "Provide subject, description, setting or settings"),
+  );
+  const saved = settings ? await setGroupSettings(jid, settings) : undefined;
+  if (!Object.keys(patch).length) return ok({ jid, settings: saved });
   const meta = await whatsapp.groupUpdate(jid, patch);
-  return ok({ jid: meta.id, name: meta.subject, description: meta.desc, announce: meta.announce, restrict: meta.restrict });
+  return ok({ jid: meta.id, name: meta.subject, description: meta.desc, announce: meta.announce, restrict: meta.restrict, settings: saved });
 });
 
 /** DELETE /api/groups/:jid → the bot leaves the group. */

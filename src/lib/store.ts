@@ -5,7 +5,7 @@
 import { and, desc, eq, gt, gte, lt, lte, ne, sql as dsql, inArray } from "drizzle-orm";
 import { db, schema } from "./db";
 import type { NormalizedMessage } from "./whatsapp/types";
-import type { Message, MessageSource, SocialItem, SocialKind } from "./db/schema";
+import type { GroupSettings, Message, MessageSource, SocialItem, SocialKind } from "./db/schema";
 import { getLogger } from "./logger";
 import { r2, r2Enabled } from "./storage/r2";
 
@@ -366,13 +366,32 @@ export async function getSummary(id: number) {
   return rows[0];
 }
 
-/** Number of command-triggered summaries a user requested since `since`. */
+/** Number of AI runs a user triggered by command since `since` (summaries and /pendientes share the daily quota). */
 export async function countUserSummariesSince(userJid: string, since: Date) {
   const [r] = await db
     .select({ n: dsql<number>`count(*)::int` })
     .from(schema.summaries)
-    .where(and(eq(schema.summaries.requestedBy, userJid), eq(schema.summaries.trigger, "command"), gte(schema.summaries.createdAt, since)));
+    .where(and(eq(schema.summaries.requestedBy, userJid), inArray(schema.summaries.trigger, ["command", "actions"]), gte(schema.summaries.createdAt, since)));
   return r?.n ?? 0;
+}
+
+export async function getGroupSettings(jid: string): Promise<GroupSettings> {
+  const rows = await db.select({ settings: schema.chats.settings }).from(schema.chats).where(eq(schema.chats.jid, jid)).limit(1);
+  return rows[0]?.settings ?? {};
+}
+
+/** Merge `patch` into the chat's settings (keys set to undefined are removed). */
+export async function setGroupSettings(jid: string, patch: GroupSettings): Promise<GroupSettings> {
+  const current = await getGroupSettings(jid);
+  const merged: GroupSettings = { ...current };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) delete (merged as Record<string, unknown>)[k];
+    else (merged as Record<string, unknown>)[k] = v;
+  }
+  const rows = await db.update(schema.chats).set({ settings: merged, updatedAt: new Date() }).where(eq(schema.chats.jid, jid)).returning({ jid: schema.chats.jid });
+  if (!rows.length) throw new Error(`chat ${jid} is unknown`);
+  log.info({ chat: jid, settings: merged }, "group settings updated");
+  return merged;
 }
 
 /** Assistant invocations by a user since `since` (command rows that are @mentions rather than slash commands). */

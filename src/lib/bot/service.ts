@@ -6,7 +6,7 @@
 import { env } from "../env";
 import { AppError } from "../errors";
 import { getLogger } from "../logger";
-import { answerQuestion, summarizeMessages, type SummaryStyle } from "../ai/summarize";
+import { answerQuestion, extractActionItems, summarizeMessages, type SummaryStyle } from "../ai/summarize";
 import { getChat, getReadMark, lastMessageFromUser, lastMessages, listArchiveSummaries, listMessages, saveSummary, searchArchiveSummaries, searchMessages, setReadMark } from "../store";
 import { fmtZoned, parseSince, SINCE_HELP, type SinceSpec } from "./since";
 import type { Message } from "../db/schema";
@@ -25,7 +25,9 @@ export type SummaryRequest = {
   focus?: string;
   language?: string;
   model?: string;
-  trigger?: "api" | "command";
+  /** spoken summaries only: "news" = radio-bulletin tone used by scheduled digests */
+  tone?: "friend" | "news";
+  trigger?: "api" | "command" | "digest" | "welcome";
   /** advance requester's read mark after summarising (default true when requesterJid given) */
   advanceMark?: boolean;
   reqId?: string;
@@ -96,6 +98,7 @@ export async function runSummary(req: SummaryRequest): Promise<SummaryResult> {
     requesterName: req.requesterName,
     archives,
     periodLabel: label,
+    tone: req.tone,
   });
   const from = messages[0].timestamp;
   const to = messages[messages.length - 1].timestamp;
@@ -114,6 +117,20 @@ export async function runSummary(req: SummaryRequest): Promise<SummaryResult> {
   if (req.requesterJid && req.advanceMark !== false) await setReadMark(req.chatJid, req.requesterJid, to);
   log.info({ summaryId: row.id, chat: req.chatJid, messages: messages.length, ms: Date.now() - t0, model: completion.model }, "summary generated");
   return { id: row.id, text: completion.text, messageCount: messages.length, from, to, label, model: completion.model, chatName: chat.name ?? undefined, ms: Date.now() - t0 };
+}
+
+/** /pendientes – open tasks, promises, questions and debts of a period (default: last 7 days). */
+export async function runActionItems(req: { chatJid: string; since?: string; forJid?: string; forName?: string; forPhone?: string; requesterJid?: string; requesterPhone?: string; language?: string; model?: string; reqId?: string }) {
+  const t0 = Date.now();
+  const chat = await getChat(req.chatJid);
+  if (!chat) throw AppError.notFound(`Chat ${req.chatJid} is unknown.`);
+  const spec = parseSince(req.since ?? "7d", { timeZone: env().BOT_TIMEZONE });
+  const { messages, label } = await resolveMessages(spec.kind === "last" ? parseSince("7d") : spec, req.chatJid, req.requesterJid, undefined, req.requesterPhone);
+  if (!messages.length) throw new AppError(404, "no_messages", "No hay mensajes en ese periodo.", { hint: "Try a wider range: since=7d or since=all.", data: { label } });
+  const completion = await extractActionItems(messages, { chatName: chat.name ?? undefined, language: req.language, model: req.model ?? env().ASK_MODEL, reqId: req.reqId, forName: req.forName, forPhone: req.forPhone, periodLabel: label });
+  const row = await saveSummary({ chatJid: req.chatJid, requestedBy: req.requesterJid ?? null, trigger: "actions", fromTs: messages[0].timestamp, toTs: messages[messages.length - 1].timestamp, messageCount: messages.length, text: completion.text, model: completion.model, promptTokens: completion.promptTokens ?? null, completionTokens: completion.completionTokens ?? null });
+  log.info({ chat: req.chatJid, messages: messages.length, for: req.forName, ms: Date.now() - t0, summaryId: row.id, reqId: req.reqId }, "action items extracted");
+  return { id: row.id, text: completion.text, messageCount: messages.length, label, chatName: chat.name ?? undefined, model: completion.model, empty: /nada pendiente/i.test(completion.text) };
 }
 
 const STOP = new Set(["que","qué","quien","quién","cual","cuál","cuando","cuándo","donde","dónde","como","cómo","por","para","con","sin","del","los","las","una","uno","unos","unas","the","what","who","when","where","how","which","about","sobre","dijo","dice","hablo","habló","hay","fue","era","son","esta","está","este","esto","esa","ese","eso","algo","alguien","sabes","sabe","saber","tiene","tienen","han","has","hemos","the","and","les","nos","mis","sus","tus","ultimo","último","ultima","última","mensaje","mensajes","grupo","chat","resumen","resume","alguna","algun","algún","pasado","pasó","paso","quien","dime","cuenta","explica","hablado","hablaron","comentado","decidido","decidió"]);

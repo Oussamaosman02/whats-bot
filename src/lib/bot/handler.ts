@@ -9,13 +9,17 @@ import { isAppError } from "../errors";
 import { whatsapp } from "../whatsapp/client";
 import { phoneFromJid } from "../whatsapp/jid";
 import type { NormalizedMessage } from "../whatsapp/types";
-import { countStickers, countUserSummariesSince, findMessageByWaId, getSticker, getStickerBytes, groupsForUser, listStickers, markMessageAsCommand, randomSticker, setReadMark } from "../store";
+import { countStickers, countUserSummariesSince, findMessageByWaId, getChat, getGroupSettings, getSticker, getStickerBytes, groupsForUser, listParticipants, listStickers, markMessageAsCommand, randomSticker, setGroupSettings, setReadMark, upsertChat } from "../store";
+import type { Chat, Digest } from "../db/schema";
+import { deleteDigest, describeDigest, getDigest, hoursEvery, normalizeHours, runDigest, upsertDigest } from "./digest";
+import { cancelJob, countPendingByUser, createJob, describeJob, getJob, listJobs } from "./jobs";
+import { parseWhen, WHEN_HELP } from "./when";
+import { sendDm } from "./deliver";
 import { pickStickerReply } from "../ai/vision";
 import { zonedParts, zonedToUtc } from "./since";
 import { helpText, parseCommand, type Command } from "./commands";
-import { runQuestion, runSummary } from "./service";
+import { runActionItems, runQuestion, runSummary } from "./service";
 import { fmtZoned, looksLikeSince, parseSince, SINCE_HELP, type SinceSpec } from "./since";
-import { zernio } from "../zernio/client";
 import { downloadMediaMessage } from "@whiskeysockets/baileys";
 import { createWriteStream } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -44,16 +48,6 @@ function fmtRange(from: Date, to: Date) {
 function fmtSeconds(s: number) {
   const n = Math.round(s);
   return n < 60 ? `${n} s` : `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")} min`;
-}
-
-/** Sends a DM to a user, via Baileys or Zernio depending on DM_TRANSPORT. */
-async function sendDm(userJid: string, text: string, reqId: string) {
-  const phone = phoneFromJid(userJid);
-  if (env().DM_TRANSPORT === "zernio" && phone) {
-    await zernio.sendToPhone({ phone, text, reqId });
-    return;
-  }
-  await whatsapp.sendText(userJid, text);
 }
 
 export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promise<void> {
@@ -104,7 +98,7 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
   // "escribiendo…" while we work; "grabando audio…" when the answer will be a voice note
   const wantsAudio = ((cmd.name === "summary" || cmd.name === "ask") && cmd.audio && ttsEnabled()) || cmd.name === "say";
   const presenceKind = wantsAudio ? "recording" : "composing";
-  const quick = cmd.name === "help" || cmd.name === "ping" || cmd.name === "id" || cmd.name === "unknown";
+  const quick = ["help", "ping", "id", "unknown", "schedule", "remind", "jobs", "cancel", "welcome", "config"].includes(cmd.name) || (cmd.name === "digest" && cmd.action !== "now");
 
   try {
     await (quick ? Promise.resolve() : whatsapp.withPresence(m.chatJid, presenceKind, () => runCommand()));
@@ -182,7 +176,7 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
           return;
         }
         const lines = groups.map((g, i) => `*${i + 1}.* ${g.name ?? g.jid}${g.lastMessageAt ? ` _(${fmtZoned(g.lastMessageAt, env().BOT_TIMEZONE)})_` : ""}`);
-        await reply(`Grupos que compartimos:\n${lines.join("\n")}\n\nUsa */resumen <nº> [periodo]* para resumir uno aquí.`);
+        await reply(`Grupos que compartimos:\n${lines.join("\n")}\n\n${groups.length === 1 ? "Como solo compartimos uno, basta con */resumen [periodo]* aquí." : "Usa */resumen <nº> [periodo]* para resumir uno aquí."}`);
         return;
       }
       case "ask": {
@@ -212,6 +206,28 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
       case "summary":
         await handleSummary(cmd, m, raw, reqId, reply);
         return;
+      case "digest":
+        await handleDigest(cmd, m, reqId, reply);
+        return;
+      case "schedule":
+      case "remind":
+        await handleJob(cmd, m, reqId, reply);
+        return;
+      case "jobs":
+        await handleJobsList(m, reply);
+        return;
+      case "cancel":
+        await handleCancel(cmd, m, reqId, reply);
+        return;
+      case "actions":
+        await handleActions(cmd, m, reqId, reply);
+        return;
+      case "welcome":
+        await handleWelcomeConfig(cmd, m, reqId, reply);
+        return;
+      case "config":
+        await handleConfig(m, reply);
+        return;
       case "import":
         await handleImport(cmd, m, raw, reqId, reply);
         return;
@@ -222,21 +238,16 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
   }
 }
 
-async function handleSummary(cmd: Extract<Command, { name: "summary" }>, m: NormalizedMessage, raw: WAMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
-  const isDm = m.chatKind === "dm";
+/** 15 s cooldown per user+chat and the DAILY_SUMMARY_LIMIT (shared by /resumen and /pendientes; admins exempt). */
+async function aiQuotaOk(m: NormalizedMessage, reply: (t: string) => Promise<unknown>, blog: { info: (o: object, msg: string) => void }) {
   const requester = m.senderJid;
-  const blog = log.child({ reqId });
-
-  // Cooldown per user
   const key = `${m.chatJid}:${requester}`;
   const last = lastRun.get(key) ?? 0;
   if (Date.now() - last < COOLDOWN_MS) {
     await reply("⏳ Espera unos segundos antes de pedir otro resumen.");
-    return;
+    return false;
   }
   lastRun.set(key, Date.now());
-
-  // Daily quota per user (admins exempt)
   const limit = env().DAILY_SUMMARY_LIMIT;
   if (requester && limit > 0 && !isAdmin(m.senderPhone)) {
     const tz = env().BOT_TIMEZONE;
@@ -246,9 +257,18 @@ async function handleSummary(cmd: Extract<Command, { name: "summary" }>, m: Norm
     if (used >= limit) {
       blog.info({ requester, used, limit }, "daily summary quota reached");
       await reply(`⛔ Ya has usado tus ${limit} resúmenes de hoy. Mañana podrás pedir más 🙂`);
-      return;
+      return false;
     }
   }
+  return true;
+}
+
+async function handleSummary(cmd: Extract<Command, { name: "summary" }>, m: NormalizedMessage, raw: WAMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const isDm = m.chatKind === "dm";
+  const requester = m.senderJid;
+  const blog = log.child({ reqId });
+
+  if (!(await aiQuotaOk(m, reply, blog))) return;
 
   // Which chat? In a group: this one, args = since expression.
   // In a DM: args = "<group number|name> [since expression]".
@@ -256,30 +276,10 @@ async function handleSummary(cmd: Extract<Command, { name: "summary" }>, m: Norm
   let sinceText = cmd.args.join(" ");
   if (isDm) {
     if (!requester) return;
-    if (!cmd.args.length) {
-      await reply("Por privado dime qué grupo: */grupos* para verlos y luego */resumen <nº o nombre> [desde]*.");
-      return;
-    }
-    const groups = await groupsForUser(requester, m.senderPhone);
-    let pick: (typeof groups)[number] | undefined;
-    let used = 0;
-    if (/^\d+$/.test(cmd.args[0]) && Number(cmd.args[0]) <= groups.length) {
-      pick = groups[Number(cmd.args[0]) - 1];
-      used = 1;
-    } else {
-      // longest token prefix that matches a group name (exact, then contains)
-      for (let n = cmd.args.length; n > 0 && !pick; n--) {
-        const needle = cmd.args.slice(0, n).join(" ").toLowerCase();
-        pick = groups.find((g) => (g.name ?? "").toLowerCase() === needle) ?? groups.find((g) => (g.name ?? "").toLowerCase().includes(needle));
-        if (pick) used = n;
-      }
-    }
-    if (!pick) {
-      await reply(`No encuentro el grupo "${cmd.args[0]}". Usa */grupos* para ver la lista.`);
-      return;
-    }
-    targetJid = pick.jid;
-    sinceText = cmd.args.slice(used).join(" ");
+    const r = await resolveGroupArg(m, cmd.args, reply, { usage: `*${env().BOT_COMMAND_PREFIX}resumen <nº o nombre> [desde]*` });
+    if (!r) return;
+    targetJid = r.group.jid;
+    sinceText = r.rest.join(" ");
   }
   if (sinceText && !looksLikeSince(sinceText)) {
     const spec = parseSince(sinceText, { timeZone: env().BOT_TIMEZONE });
@@ -431,6 +431,366 @@ async function replyVoice(m: NormalizedMessage, text: string, reqId: string, rep
   }
 }
 
+/**
+ * In a DM, which shared group does the user mean? `args` may start with the group number (from /grupos) or a
+ * (prefix of the) group name. When the user shares exactly ONE group with the bot it is taken by default, so
+ * nobody has to name it every time. Replies with guidance and returns undefined when it cannot decide.
+ */
+async function resolveGroupArg(m: NormalizedMessage, args: string[], reply: (t: string) => Promise<unknown>, opts: { usage: string }): Promise<{ group: Chat; rest: string[] } | undefined> {
+  if (!m.senderJid) return undefined;
+  const groups = await groupsForUser(m.senderJid, m.senderPhone);
+  if (!groups.length) {
+    await reply("No compartimos ningún grupo todavía (o aún no he sincronizado). Añádeme a un grupo y escribe algo en él.");
+    return undefined;
+  }
+  let pick: Chat | undefined;
+  let used = 0;
+  if (args.length && /^\d+$/.test(args[0]) && Number(args[0]) >= 1 && Number(args[0]) <= groups.length) {
+    pick = groups[Number(args[0]) - 1];
+    used = 1;
+  } else {
+    // longest token prefix that matches a group name (exact, then contains)
+    for (let n = args.length; n > 0 && !pick; n--) {
+      const needle = args.slice(0, n).join(" ").toLowerCase();
+      pick = groups.find((g) => (g.name ?? "").toLowerCase() === needle) ?? groups.find((g) => (g.name ?? "").toLowerCase().includes(needle));
+      if (pick) used = n;
+    }
+  }
+  if (!pick && groups.length === 1) {
+    pick = groups[0]; // the only shared group → implicit
+    used = 0;
+  }
+  if (!pick) {
+    await reply(args.length ? `No encuentro el grupo "${args[0]}". Usa */grupos* para ver la lista.` : `Por privado dime qué grupo: */grupos* para verlos y luego ${opts.usage}.`);
+    return undefined;
+  }
+  return { group: pick, rest: args.slice(used) };
+}
+
+/** WhatsApp group admin (participants snapshot) – by jid or phone, LID-safe. */
+async function isGroupAdmin(chatJid: string, userJid?: string, phone?: string) {
+  if (!userJid && !phone) return false;
+  const ps = await listParticipants(chatJid);
+  return ps.some((p) => p.isAdmin && ((userJid && p.userJid === userJid) || (phone && p.phone === phone)));
+}
+
+/**
+ * /boletin – scheduled digest ("breaking news") of a group at fixed hours, as a voice note or text.
+ * Anyone can look at it; only group admins (or ADMIN_PHONES) change it. Works in the group or by DM
+ * (`/boletin <grupo> …`; the group is implicit when only one is shared).
+ */
+async function handleDigest(cmd: Extract<Command, { name: "digest" }>, m: NormalizedMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const blog = log.child({ reqId, cmd: "digest", action: cmd.action });
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  let group: Chat | undefined;
+  let extra: string[] = cmd.args;
+  if (cmd.private) {
+    // Private brief: the digest row belongs to the user's DM chat and covers every shared group
+    if (!isDm) {
+      await reply(`El boletín privado se configura por privado: escríbeme *${p}boletin 8:00 privado* en nuestro chat.`);
+      return;
+    }
+    group = await getChat(m.chatJid);
+    if (!group) {
+      await upsertChat({ jid: m.chatJid, kind: "dm", name: m.senderName ?? null, lastMessageAt: m.timestamp });
+      group = await getChat(m.chatJid);
+    }
+    if (!group) return;
+  } else if (isDm) {
+    const r = await resolveGroupArg(m, cmd.args, reply, { usage: `*${p}boletin <nº o nombre> 06:00 14:00 22:00 audio*` });
+    if (!r) return;
+    group = r.group;
+    extra = r.rest;
+  } else {
+    group = await getChat(m.chatJid);
+    if (!group) {
+      await reply("Todavía no conozco este grupo; escribe algo y vuelve a intentarlo.");
+      return;
+    }
+  }
+  if (extra.length) {
+    await reply(`No entiendo "${extra.join(" ")}". Ejemplos: *${p}boletin 06:00 14:00 22:00 audio* · *${p}boletin cada 8h desde 06:00* · *${p}boletin texto* · *${p}boletin off* · *${p}boletin ahora*.`);
+    return;
+  }
+  const existing = await getDigest(group.jid);
+  const priv = cmd.private;
+  if (cmd.action === "show") {
+    await reply(existing ? describeDigest(existing, group.name, priv) : priv ? `No tienes boletín privado. Créalo con *${p}boletin 8:00 privado* (texto) o *${p}boletin 8:00 privado audio*.` : `Este grupo no tiene boletín programado. Un admin puede crearlo con *${p}boletin 06:00 14:00 22:00 audio* (nota de voz con las novedades a esas horas) o *${p}boletin cada 8h desde 06:00*.`);
+    return;
+  }
+  const allowed = priv || isAdmin(m.senderPhone) || (await isGroupAdmin(group.jid, m.senderJid, m.senderPhone));
+  if (!allowed) {
+    blog.warn({ from: m.senderPhone ?? m.senderJid, chat: group.jid }, "digest change attempted by non-admin – refused");
+    await reply("Solo los administradores del grupo pueden configurar el boletín 🙂");
+    return;
+  }
+  switch (cmd.action) {
+    case "set": {
+      let hours: string[] | undefined = cmd.hours.length ? normalizeHours(cmd.hours) : undefined;
+      if (cmd.every) hours = hoursEvery(cmd.every, hours?.[0] ?? "06:00");
+      if (!hours && !existing) {
+        await reply(`¿A qué horas? Ej: *${p}boletin 06:00 14:00 22:00 audio* o *${p}boletin cada 8h desde 06:00*.`);
+        return;
+      }
+      const d = await upsertDigest({ chatJid: group.jid, hours, audio: priv ? (cmd.audio ?? existing?.audio ?? false) : cmd.audio, style: cmd.style, enabled: true, createdBy: m.senderJid, createdByName: m.senderName ?? m.senderPhone });
+      const ttsNote = d.audio && !ttsEnabled() ? "\n⚠️ La voz no está configurada (ELEVENLABS_API_KEY): irá en texto." : "";
+      await reply(`${existing ? "Boletín actualizado" : "Boletín programado"} ✅\n${describeDigest(d, group.name, priv)}${ttsNote}\n\n_${priv ? "Solo incluyo los grupos con" : "Solo publico si hay"} al menos ${d.minMessages} mensajes nuevos. *${p}boletin ${priv ? "privado " : ""}ahora* para probarlo, *${p}boletin ${priv ? "privado " : ""}off* para pausarlo._`);
+      return;
+    }
+    case "off":
+    case "on": {
+      if (!existing) {
+        await reply(`Este grupo no tiene boletín. Créalo con *${p}boletin 06:00 14:00 22:00 audio*.`);
+        return;
+      }
+      const d = await upsertDigest({ chatJid: group.jid, enabled: cmd.action === "on" });
+      await reply(cmd.action === "on" ? `Boletín reactivado ✅ Próximo: ${fmtZoned(d.nextRunAt, env().BOT_TIMEZONE)}.` : "Boletín pausado ⏸️ Vuelve con *" + p + "boletin on*.");
+      return;
+    }
+    case "remove": {
+      const removed = await deleteDigest(group.jid);
+      await reply(removed ? "Boletín eliminado 🗑️" : "Este grupo no tenía boletín.");
+      return;
+    }
+    case "now": {
+      // Preview: post one digest right now (does not touch the schedule). Without a config, the last 8 h.
+      const now = new Date();
+      const d: Digest = existing ?? { id: 0, chatJid: group.jid, hours: ["06:00", "14:00", "22:00"], audio: cmd.audio ?? true, style: cmd.style ?? "bullets", enabled: false, minMessages: 1, createdBy: null, createdByName: null, lastRunAt: new Date(now.getTime() - 8 * 3_600_000), lastSentAt: null, lastError: null, nextRunAt: now, createdAt: now, updatedAt: now };
+      if (isDm) await reply(priv ? "🌅 Preparando tu boletín…" : `📰 Preparando el boletín de *${group.name ?? group.jid}*…`);
+      const r = await runDigest(existing ? { ...d, audio: cmd.audio ?? d.audio, style: cmd.style ?? d.style } : priv ? { ...d, audio: cmd.audio ?? false } : d, { force: true, reqId: `dig-now-${reqId}` });
+      if (r.posted) {
+        if (isDm && !priv) await reply(`✅ Boletín enviado a *${group.name ?? group.jid}* (${r.messages} mensajes, ${r.audio ? "nota de voz" : "texto"}).`);
+        return;
+      }
+      await reply(r.reason === "not_connected" ? "⚠️ No estoy conectado a WhatsApp ahora mismo." : `Nada que contar: ${r.messages ? `solo ${r.messages} mensajes` : "no hay mensajes nuevos"} desde las ${fmtZoned(r.from, env().BOT_TIMEZONE, false)}.`);
+      return;
+    }
+  }
+}
+
+const jidUser = (j?: string) => (j ?? "").split(":")[0].split("@")[0];
+
+/** /programar (admins, posts as the bot) and /recordar (anyone; mentions the author, or DM to self). */
+async function handleJob(cmd: Extract<Command, { name: "schedule" | "remind" }>, m: NormalizedMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const blog = log.child({ reqId, cmd: cmd.name });
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  const kind = cmd.name === "schedule" ? "message" : "reminder";
+  if (!m.senderJid) return;
+  let tokens = cmd.text.split(/\s+/).filter(Boolean);
+  const leadMentions: string[] = [];
+  while (tokens[0]?.startsWith("@")) leadMentions.push(tokens.shift()!);
+  let targetJid = m.chatJid;
+  let targetName: string | undefined;
+  if (isDm && kind === "message") {
+    const r = await resolveGroupArg(m, tokens, reply, { usage: `*${p}programar <grupo> mañana 9:00 <texto>*` });
+    if (!r) return;
+    targetJid = r.group.jid;
+    targetName = r.group.name ?? undefined;
+    tokens = r.rest;
+  }
+  if (!tokens.length) {
+    await reply(kind === "reminder" ? `¿Cuándo y qué? Ej: *${p}recordar mañana 9:00 llevar el pastel*. ${WHEN_HELP}` : `¿Cuándo y qué? Ej: *${p}programar el lunes 9:00 Recordad traer el DNI*. ${WHEN_HELP}`);
+    return;
+  }
+  const when = parseWhen(tokens.join(" "), { timeZone: env().BOT_TIMEZONE });
+  if ("error" in when) {
+    blog.info({ text: tokens.join(" ").slice(0, 80), error: when.error }, "when expression not understood");
+    await reply(when.error === "that date is in the past" || when.error === "that time has already passed today" ? "Esa hora ya ha pasado 🙂 Dime una futura." : `No entiendo cuándo. ${WHEN_HELP}`);
+    return;
+  }
+  let text = [...leadMentions, when.rest].join(" ").trim();
+  if (!text && m.quoted?.text) text = m.quoted.text.trim();
+  if (!text) {
+    await reply(kind === "reminder" ? "¿Qué te recuerdo? Escribe el texto después de la hora, o responde a un mensaje con el comando." : "¿Qué mensaje publico? Escríbelo después de la hora.");
+    return;
+  }
+  const admin = isAdmin(m.senderPhone) || (await isGroupAdmin(targetJid, m.senderJid, m.senderPhone));
+  if (kind === "message" && !admin) {
+    blog.warn({ from: m.senderPhone ?? m.senderJid, chat: targetJid }, "scheduled message attempted by non-admin – refused");
+    await reply(`Solo los administradores pueden programar mensajes del bot. Para ti mismo usa *${p}recordar …* 🙂`);
+    return;
+  }
+  if (!isAdmin(m.senderPhone)) {
+    const pending = await countPendingByUser(m.senderJid);
+    if (pending >= env().JOBS_MAX_PENDING_PER_USER) {
+      await reply(`Ya tienes ${pending} recordatorios pendientes (máximo ${env().JOBS_MAX_PENDING_PER_USER}). Cancela alguno con *${p}programados* y *${p}cancelar <nº>*.`);
+      return;
+    }
+  }
+  const me = whatsapp.meJid;
+  const meLid = whatsapp.meLid;
+  const mentions = m.mentions.filter((j) => jidUser(j) !== jidUser(me) && jidUser(j) !== jidUser(meLid));
+  const job = await createJob({ kind, chatJid: targetJid, originJid: m.chatJid, text, mentions, dueAt: when.at, recurrence: when.recurrence, createdBy: m.senderJid, createdByName: m.senderName ?? m.senderPhone });
+  blog.info({ id: job.id, kind, chat: targetJid, due: job.dueAt.toISOString(), recurrence: job.recurrence?.kind }, "job scheduled by command");
+  const where = targetName ? ` en *${targetName}*` : "";
+  await reply(`${kind === "reminder" ? "⏰ Te lo recuerdo" : "🗓️ Programado"} ${when.label}${where}.\n_#${job.id} · *${p}programados* para verlos · *${p}cancelar ${job.id}* para anularlo_`);
+}
+
+/** /programados – pending jobs of this group, or (by DM) everything the user scheduled. */
+async function handleJobsList(m: NormalizedMessage, reply: (t: string) => Promise<unknown>) {
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  const rows = isDm && m.senderJid ? await listJobs({ createdBy: m.senderJid, status: ["pending"], limit: 30 }) : await listJobs({ chatJid: m.chatJid, status: ["pending"], limit: 30 });
+  if (!rows.length) {
+    await reply(`No hay nada programado${isDm ? "" : " en este grupo"}. *${p}recordar mañana 9:00 <texto>* para crear un recordatorio.`);
+    return;
+  }
+  const names = new Map<string, string | null>();
+  for (const j of rows) if (isDm && j.chatJid !== m.chatJid && !names.has(j.chatJid)) names.set(j.chatJid, (await getChat(j.chatJid))?.name ?? j.chatJid);
+  const lines = rows.map((j) => describeJob(j, { chatName: names.get(j.chatJid) }) + (!isDm && j.createdByName ? ` _(${j.createdByName})_` : ""));
+  await reply(`🗓️ *Programado* (${env().BOT_TIMEZONE}):\n${lines.join("\n")}\n\n_*${p}cancelar <nº>* para anular uno._`);
+}
+
+/** /cancelar <id> – creator, ADMIN_PHONES or a group admin of the target chat. */
+async function handleCancel(cmd: Extract<Command, { name: "cancel" }>, m: NormalizedMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const p = env().BOT_COMMAND_PREFIX;
+  if (!cmd.id) {
+    await reply(`¿Cuál? *${p}cancelar <nº>* (mira *${p}programados*).`);
+    return;
+  }
+  const job = await getJob(cmd.id);
+  const visible = job && (job.chatJid === m.chatJid || job.originJid === m.chatJid || job.createdBy === m.senderJid);
+  if (!job || !visible) {
+    await reply(`No encuentro el nº ${cmd.id}. Mira *${p}programados*.`);
+    return;
+  }
+  const mine = job.createdBy === m.senderJid || (m.senderPhone && phoneFromJid(job.createdBy ?? undefined) === m.senderPhone);
+  const allowed = mine || isAdmin(m.senderPhone) || (await isGroupAdmin(job.chatJid, m.senderJid, m.senderPhone));
+  if (!allowed) {
+    log.warn({ reqId, id: job.id, from: m.senderPhone ?? m.senderJid }, "cancel attempted by someone else – refused");
+    await reply("Solo quien lo creó (o un admin) puede cancelarlo.");
+    return;
+  }
+  const c = await cancelJob(job.id);
+  await reply(c ? `❌ Cancelado el nº ${job.id} (${job.text.slice(0, 60)}).` : `El nº ${job.id} ya no estaba pendiente (${job.status}).`);
+}
+
+/** /pendientes [míos] [periodo] – open tasks, promises, questions and debts; by DM: /pendientes [grupo] … */
+async function handleActions(cmd: Extract<Command, { name: "actions" }>, m: NormalizedMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const blog = log.child({ reqId, cmd: "actions" });
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  let chatJid = m.chatJid;
+  let args = cmd.args;
+  if (isDm) {
+    const r = await resolveGroupArg(m, cmd.args, reply, { usage: `*${p}pendientes <nº o nombre> [periodo]*` });
+    if (!r) return;
+    chatJid = r.group.jid;
+    args = r.rest;
+  }
+  const since = args.join(" ");
+  if (since && !looksLikeSince(since)) {
+    await reply(`No entiendo el periodo "${since}". ${SINCE_HELP}`);
+    return;
+  }
+  if (!(await aiQuotaOk(m, reply, blog))) return;
+  const res = await runActionItems({ chatJid, since: since || undefined, requesterJid: m.senderJid, requesterPhone: m.senderPhone, forName: cmd.mine ? (m.senderName ?? m.senderPhone) : undefined, forPhone: cmd.mine ? m.senderPhone : undefined, reqId });
+  const title = `📋 *Pendientes${cmd.mine ? " tuyos" : ""}${isDm && res.chatName ? ` de ${res.chatName}` : ""}* – ${res.label}`;
+  await reply(`${title}\n\n${res.text}${res.empty ? "" : `\n\n_*${p}recordar mañana 9:00 <tarea>* para que lo avise a tiempo._`}`);
+}
+
+/** /bienvenida [grupo] [on|off|N días] – DM newcomers a brief of the last N days. */
+async function handleWelcomeConfig(cmd: Extract<Command, { name: "welcome" }>, m: NormalizedMessage, reqId: string, reply: (t: string) => Promise<unknown>) {
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  let group: Chat | undefined;
+  if (isDm) {
+    const r = await resolveGroupArg(m, cmd.args, reply, { usage: `*${p}bienvenida <nº o nombre> on*` });
+    if (!r) return;
+    group = r.group;
+  } else group = await getChat(m.chatJid);
+  if (!group) return;
+  const settings = await getGroupSettings(group.jid);
+  const days = settings.welcomeDays ?? env().WELCOME_BRIEF_DAYS;
+  if (cmd.action === "show") {
+    await reply(settings.welcomeBrief ? `👋 Bienvenida activa en *${group.name ?? group.jid}*: a quien entre le mando por privado un resumen de los últimos ${days} días y los pendientes. *${p}bienvenida off* para desactivarla, *${p}bienvenida 7* para cambiar los días.` : `👋 Bienvenida desactivada en *${group.name ?? group.jid}*. Un admin puede activarla con *${p}bienvenida on* (resumen de los últimos ${days} días por privado a quien entre) o *${p}bienvenida 7* (días).`);
+    return;
+  }
+  if (!(isAdmin(m.senderPhone) || (await isGroupAdmin(group.jid, m.senderJid, m.senderPhone)))) {
+    log.warn({ reqId, from: m.senderPhone ?? m.senderJid, chat: group.jid }, "welcome change attempted by non-admin – refused");
+    await reply("Solo los administradores del grupo pueden cambiar esto 🙂");
+    return;
+  }
+  const saved = await setGroupSettings(group.jid, cmd.action === "on" ? { welcomeBrief: true, welcomeDays: cmd.days ?? settings.welcomeDays } : { welcomeBrief: false });
+  await reply(cmd.action === "on" ? `👋 Bienvenida activada en *${group.name ?? group.jid}*: resumen de los últimos ${saved.welcomeDays ?? env().WELCOME_BRIEF_DAYS} días + pendientes, por privado, a quien entre. Nunca escribo en el grupo por esto.` : `👋 Bienvenida desactivada en *${group.name ?? group.jid}*.`);
+}
+
+/** /config – everything the bot has configured for this group. */
+async function handleConfig(m: NormalizedMessage, reply: (t: string) => Promise<unknown>) {
+  const isDm = m.chatKind === "dm";
+  const p = env().BOT_COMMAND_PREFIX;
+  let group: Chat | undefined;
+  if (isDm) {
+    const r = await resolveGroupArg(m, [], reply, { usage: `*${p}config*` });
+    if (!r) return;
+    group = r.group;
+  } else group = await getChat(m.chatJid);
+  if (!group) return;
+  const [digest, settings, jobs, priv] = await Promise.all([getDigest(group.jid), getGroupSettings(group.jid), listJobs({ chatJid: group.jid, status: ["pending"], limit: 100 }), isDm ? getDigest(m.chatJid) : Promise.resolve(undefined)]);
+  const e = env();
+  const lines = [
+    `⚙️ *${group.name ?? group.jid}*`,
+    digest ? describeDigest(digest, null) : `📰 Boletín: no programado (*${p}boletin 06:00 14:00 22:00 audio*)`,
+    settings.welcomeBrief ? `👋 Bienvenida: activa, ${settings.welcomeDays ?? e.WELCOME_BRIEF_DAYS} días` : `👋 Bienvenida: desactivada (*${p}bienvenida on*)`,
+    `🗓️ Programado: ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"} (*${p}programados*)`,
+    `📏 Cuotas: ${e.DAILY_SUMMARY_LIMIT} resúmenes/pendientes, ${e.ASSISTANT_DAILY_LIMIT} peticiones al asistente y ${e.ASSISTANT_AUDIO_DAILY_LIMIT} audios por persona y día · zona horaria ${e.BOT_TIMEZONE}`,
+  ];
+  if (isDm) lines.push(priv ? describeDigest(priv, null, true) : `🌅 Boletín privado: no configurado (*${p}boletin 8:00 privado*)`);
+  await reply(lines.join("\n"));
+}
+
+/**
+ * Welcome brief: when someone is added to a group with `welcomeBrief` on, DM them (never the group) a
+ * summary of the last N days plus the open items. At most 5 people per event; failures are logged only.
+ */
+async function handleParticipants(groupJid: string, participants: string[], action: "add" | "remove" | "promote" | "demote") {
+  if (action !== "add") return;
+  const settings = await getGroupSettings(groupJid);
+  if (!settings.welcomeBrief) return;
+  const reqId = `wel-${Date.now().toString(36)}`;
+  const wlog = log.child({ reqId, chat: groupJid, mode: "welcome" });
+  const e = env();
+  const me = whatsapp.meJid;
+  const targets = participants.filter((j) => jidUser(j) !== jidUser(me) && jidUser(j) !== jidUser(whatsapp.meLid)).slice(0, 5);
+  if (!targets.length) return;
+  const chat = await getChat(groupJid);
+  const days = settings.welcomeDays ?? e.WELCOME_BRIEF_DAYS;
+  const name = chat?.name ?? "el grupo";
+  const p = e.BOT_COMMAND_PREFIX;
+  let summary: string | undefined;
+  let pending: string | undefined;
+  try {
+    summary = (await runSummary({ chatJid: groupJid, since: `${days}d`, style: "bullets", trigger: "welcome", reqId })).text;
+  } catch (err) {
+    if (!(isAppError(err) && err.code === "no_messages")) wlog.warn({ err: errInfo(err), hint: isAppError(err) ? err.hint : "Summary failed; sending a plain welcome." }, "welcome summary failed");
+  }
+  if (summary) {
+    try {
+      const r = await runActionItems({ chatJid: groupJid, since: `${days}d`, reqId });
+      if (!r.empty) pending = r.text;
+    } catch (err) {
+      wlog.warn({ err: errInfo(err) }, "welcome action items failed – skipped");
+    }
+  }
+  const text = [
+    `👋 ¡Hola! Soy *${e.BOT_NAME}*, el bot de *${name}*. Te pongo al día por privado para no llenar el grupo.`,
+    summary ? `\n📝 *Lo último (${days} días)*\n${summary}` : `\nEn los últimos ${days} días no ha habido mucho movimiento.`,
+    pending ? `\n📋 *Pendientes*\n${pending}` : "",
+    `\n_En el grupo puedes escribir *${p}resumen*, *${p}preguntar <algo>* o mencionarme. *${p}ayuda* para verlo todo._`,
+  ].join("\n");
+  for (const [i, jid] of targets.entries()) {
+    try {
+      await sendDm(jid, text, reqId);
+      wlog.info({ to: jid, days, summary: Boolean(summary), pending: Boolean(pending) }, "👋 welcome brief sent");
+    } catch (err) {
+      wlog.warn({ err: errInfo(err), to: jid, hint: isAppError(err) ? err.hint : "Could not DM the newcomer (privacy settings or unknown number)." }, "welcome brief not delivered");
+    }
+    if (i < targets.length - 1) await new Promise((r) => setTimeout(r, 3_000 + Math.random() * 3_000));
+  }
+}
+
 function isAdmin(phone?: string) {
   const e = env();
   const admins = e.ADMIN_PHONES.length ? e.ADMIN_PHONES : e.ALERT_PHONE ? [e.ALERT_PHONE.replace(/[^\d]/g, "")] : [];
@@ -467,17 +827,9 @@ async function handleImport(cmd: Extract<Command, { name: "import" }>, m: Normal
     await reply("📎 Envíame el archivo exportado del chat (zip o txt) *como documento* con el texto */importar <nº o nombre del grupo>*, o responde a ese archivo con el comando.\nConsejo: exporta *sin archivos* para que pese poco.");
     return;
   }
-  if (!cmd.args.length || !m.senderJid) {
-    await reply("¿A qué grupo? */importar <nº o nombre>* (mira */grupos*).");
-    return;
-  }
-  const groups = await groupsForUser(m.senderJid, m.senderPhone);
-  const needle = cmd.args.join(" ").toLowerCase();
-  const pick = (/^\d+$/.test(needle) && groups[Number(needle) - 1]) || groups.find((g) => (g.name ?? "").toLowerCase() === needle) || groups.find((g) => (g.name ?? "").toLowerCase().includes(needle));
-  if (!pick) {
-    await reply(`No encuentro el grupo "${cmd.args.join(" ")}". Usa */grupos*.`);
-    return;
-  }
+  const r = await resolveGroupArg(m, cmd.args, reply, { usage: "*/importar <nº o nombre>*" });
+  if (!r) return;
+  const pick = r.group;
   const sizeMb = (fileMeta?.fileLength ?? 0) / 1e6;
   if (sizeMb > env().IMPORT_MAX_MB) {
     await reply(`El archivo pesa ${sizeMb.toFixed(0)} MB (máximo ${env().IMPORT_MAX_MB} MB por WhatsApp). Exporta el chat *sin archivos* o súbelo por la API (POST /api/groups/<jid>/import).`);
@@ -504,5 +856,6 @@ async function handleImport(cmd: Extract<Command, { name: "import" }>, m: Normal
 /** Wire the handler into the WhatsApp client (idempotent). */
 export function registerBot() {
   whatsapp.setInboundHandler(handleInbound);
+  whatsapp.setParticipantsHandler(handleParticipants);
   log.info({ name: env().BOT_NAME, prefix: env().BOT_COMMAND_PREFIX, lang: env().BOT_LANGUAGE, dmTransport: env().DM_TRANSPORT, model: env().GEMINI_MODEL }, "bot handler registered");
 }

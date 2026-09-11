@@ -92,6 +92,21 @@ const schema = z.object({
     .default("true")
     .transform((v) => v !== "false" && v !== "0"),
   DAILY_SUMMARY_LIMIT: z.coerce.number().default(3),
+  /** Scheduled digests ("boletín"): master switch for the in-process scheduler */
+  DIGEST_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v !== "false" && v !== "0"),
+  /** a slot found more than this many minutes late (server was down) is skipped, not posted at an odd hour */
+  DIGEST_MAX_LATE_MINUTES: z.coerce.number().default(90),
+  /** default minimum of new messages for a slot to post anything (per-group override via /boletin or the API) */
+  DIGEST_MIN_MESSAGES: z.coerce.number().default(5),
+  /** Scheduled messages / reminders: a job found later than this (minutes) after a restart is marked missed instead of sent */
+  JOBS_MAX_LATE_MINUTES: z.coerce.number().default(180),
+  /** pending jobs a non-admin user may have at once */
+  JOBS_MAX_PENDING_PER_USER: z.coerce.number().default(20),
+  /** Welcome brief: default number of days summarised for a newcomer (per-group override via /bienvenida) */
+  WELCOME_BRIEF_DAYS: z.coerce.number().default(3),
   ALERT_PHONE: optionalString,
   ALERT_TEMPLATE_NAME: optionalString,
   ALERT_TEMPLATE_LANGUAGE: z.string().default("es"),

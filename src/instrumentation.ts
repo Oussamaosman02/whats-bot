@@ -16,6 +16,10 @@ export async function register() {
     registerBot();
     const { startRetentionScheduler } = await import("./lib/maintenance");
     startRetentionScheduler();
+    const { startDigestScheduler } = await import("./lib/bot/digest");
+    startDigestScheduler();
+    const { startJobScheduler } = await import("./lib/bot/jobs");
+    startJobScheduler();
 
     if (e.WHATSAPP_AUTOSTART) {
       const { whatsapp } = await import("./lib/whatsapp/client");

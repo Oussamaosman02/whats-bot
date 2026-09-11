@@ -72,6 +72,10 @@ Rules: unknown period arguments are rejected with usage help (no guessing); 15 s
 26. **Assistant quotas**: 20 requests and **3 audios** per user per day (`ASSISTANT_DAILY_LIMIT`, `ASSISTANT_AUDIO_DAILY_LIMIT`), `ADMIN_PHONES` exempt. Audio counts live in a new `usage_counters` table (user, kind, local day). When the audio quota is hit, summaries/answers fall back to text with a one-line note; custom audios get a short refusal. Counts were back-filled for the audios sent before the counter existed.
 27. **Voice-note TL;DR** (from a parallel session): `/transcribir breve|resumen|tldr` replies with 2–5 bullets; long transcripts (≥ 60 s or ≥ 700 chars) end with a hint offering it; `POST /api/messages/:id/transcribe {brief:true}` returns `summary`. `TODO.md` holds a ranked feature backlog grounded in X/Reddit research (expenses, reminders, action items, lists, scheduled digest, welcome brief, events, stats, links library…).
 
+28. **Scheduled bulletins (`/boletin`)** (2026-09-11): a member asked for "Breaking News de audio cada 8 h a las 06:00, 14:00 y 22:00". New `digests` table (one row per group: hours, audio, style, enabled, minMessages, lastRunAt, nextRunAt), `src/lib/bot/digest.ts` (schedule maths in `BOT_TIMEZONE`, atomic claim, `runDigest`, one-minute scheduler started from `instrumentation.ts`), `tone: "news"` prompt in `summarize.ts` (radio-bulletin voice), `/boletin` command (group admins or `ADMIN_PHONES`; also by DM with `/boletin <grupo> …`), API `GET/PUT/DELETE/POST /api/groups/:jid/digest` + `GET /api/digests`, env `DIGEST_ENABLED/MIN_MESSAGES/MAX_LATE_MINUTES`. Also: in DMs the only shared group is now implied for `/resumen`, `/boletin`, `/importar`.
+
+29. **Reminders, scheduled messages, action items, private brief, welcome brief** (2026-09-11, same session): `jobs` table + `src/lib/bot/jobs.ts` (30 s tick, atomic claim, retries, `missed`), `src/lib/bot/when.ts` (future-time grammar, recurrence), `/recordar` `/programar` `/programados` `/cancelar`; `extractActionItems` + `runActionItems` → `/pendientes [míos]` (`POST /api/groups/:jid/actions`, trigger `actions`, shares the summary quota); `/boletin 8:00 privado` → `runPrivateBrief` (digest row keyed by the DM jid); `chats.settings` column (separate from `metadata`, which group syncs overwrite) + `/bienvenida` + `whatsapp.setParticipantsHandler` → welcome DM; `/config`; `sendDm` moved to `src/lib/bot/deliver.ts`. DDL was applied by script because `drizzle-kit push` needs a TTY (it wants to re-create two unrelated PKs).
+
 ## 4. Live state (as of 2026-09-08)
 
 - URL: https://<your-railway-domain> — Railway project `whats-bot`, service `whats-bot`.
@@ -108,5 +112,8 @@ src/lib/maintenance.ts     retention + archive                  src/lib/alerts.t
 src/lib/ai/tts.ts          ElevenLabs voice notes               src/lib/ai/vision.ts    sticker/photo captions, sticker picker
 src/lib/storage/r2.ts      Cloudflare R2 client                 src/lib/whatsapp/sticker.ts  image → WebP sticker
 src/lib/bot/assistant.ts   @mention assistant (Gemini tools)    TODO.md                 feature backlog (research-based)
+src/lib/bot/digest.ts      /boletin scheduler (digests table)   src/app/api/groups/[jid]/digest, src/app/api/digests
+src/lib/bot/jobs.ts        /recordar /programar (jobs table)    src/lib/bot/when.ts     future-time parser · src/app/api/jobs
+src/lib/bot/schedule.ts    slot maths for digests               src/lib/bot/deliver.ts  sendDm (Baileys / Zernio)
 src/app/api/**             all endpoints (GET /api lists them)  README.md               setup, commands, API, deploy, logs
 ```

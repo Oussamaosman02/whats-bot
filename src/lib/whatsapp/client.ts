@@ -42,6 +42,8 @@ import { sendAlert } from "../alerts";
 const log = getLogger("wa");
 
 export type InboundHandler = (m: NormalizedMessage, raw: WAMessage) => Promise<void>;
+/** Called after other people (not the bot) are added to / removed from a group. */
+export type ParticipantsHandler = (groupJid: string, participants: string[], action: "add" | "remove" | "promote" | "demote") => Promise<void>;
 
 const DISCONNECT_HINTS: Record<number, string> = {
   [DisconnectReason.loggedOut]: "The phone unlinked this device. Call POST /api/whatsapp/logout then GET /api/whatsapp/qr and scan again.",
@@ -77,6 +79,11 @@ class WhatsAppClient {
 
   setInboundHandler(h: InboundHandler) {
     this.handler = h;
+  }
+
+  private participantsHandler?: ParticipantsHandler;
+  setParticipantsHandler(h: ParticipantsHandler) {
+    this.participantsHandler = h;
   }
 
   getStatus(): WhatsAppStatus {
@@ -271,6 +278,9 @@ class WhatsAppClient {
         await this.groupMeta(id, true).catch(() => {});
       }
       await markParticipants(id, participants, action as "add" | "remove" | "promote" | "demote").catch(() => {});
+      if (!affectsMe && this.participantsHandler) {
+        this.participantsHandler(id, participants, action as "add" | "remove" | "promote" | "demote").catch((e) => log.error({ err: errInfo(e), group: id, action, hint: "Participant hook (welcome brief) failed; see stack." }, "participants handler failed"));
+      }
     });
   }
 
