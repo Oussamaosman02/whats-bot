@@ -266,7 +266,11 @@ export function helpText(opts: { isDm: boolean }) {
     `Responde a una nota de voz con *${p}transcribir* para leerla, o *${p}transcribir breve* para quedarte solo con lo importante (las notas de voz ya se transcriben solas para los resúmenes).`,
     `*${p}sticker* – un sticker al azar · *${p}sticker <palabra>* – busca uno · respondiendo a un mensaje: el que mejor le pegue · respondiendo a una foto: la convierte en sticker.`,
   ];
-  if (!opts.isDm) lines.push(`Menciónáme (*@${bot}*) y pídemelo en lenguaje natural: "resume desde ayer", "haz un audio diciendo…", "manda un sticker de risa", o pregúntame lo que quieras.`);
+  lines.push(
+    opts.isDm
+      ? `Escribe *@bot* y pídemelo en lenguaje natural: "@bot resume el grupo de la familia", "@bot qué se decidió ayer en el 2", "@bot haz un audio diciendo…", "@bot recuérdame mañana comprar pan", o pregúntame lo que quieras. Aquí todo te llega en privado.`
+      : `Menciónáme (*@${bot}*) y pídemelo en lenguaje natural: "resume desde ayer", "haz un audio diciendo…", "manda un sticker de risa", o pregúntame lo que quieras.`,
+  );
   if (opts.isDm) {
     lines.push(`*${p}grupos* – lista los grupos que compartimos`, `*${p}resumen <nº o nombre del grupo> [periodo]* – resume ese grupo aquí (si solo compartimos un grupo, no hace falta indicarlo)`);
   } else {

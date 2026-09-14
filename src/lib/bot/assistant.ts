@@ -1,7 +1,9 @@
 /**
- * Assistant mode: "@bot <natural language>" in a group.
+ * Assistant mode: "@<bot> <natural language>" in a group, or "@bot <natural language>" in a private chat.
  * Gemini decides what to do with a small set of tools (summarise, answer from history, create a voice
  * note, send a sticker, transcribe the quoted audio, set the read mark) or simply answers in text.
+ * In a private chat the tools that read a group take a `group` argument (number or name from the groups the
+ * user shares with the bot; implicit when there is only one) and every output is delivered privately.
  * Audio produced here always uses the SECONDARY ElevenLabs voice.
  * "Superpowers": search X/Twitter, YouTube, TikTok, the web or read a URL (src/lib/social) – these tools RETURN data to
  * Gemini, which then explains / summarises / answers in text; every lookup is recorded in `social_lookups`.
@@ -19,18 +21,24 @@ import type { NormalizedMessage } from "../whatsapp/types";
 import { fmtZoned } from "./since";
 import { runActionItems, runQuestion, runSummary } from "./service";
 import { socialCapabilities, socialLookup, type SocialItem, type SocialKind } from "../social";
-import { bumpUsage, countStickers, findMessageByWaId, getSticker, getStickerBytes, getUsage, lastMessages, listStickers, randomSticker, setMessageTranscript, setReadMark } from "../store";
+import { bumpUsage, countStickers, findMessageByWaId, getChat, getSticker, getStickerBytes, getUsage, groupsForUser, lastMessages, listStickers, randomSticker, setMessageTranscript, setReadMark } from "../store";
+import type { Chat } from "../db/schema";
 import { cancelJob, countPendingByUser, createJob, getJob, listJobs } from "./jobs";
 import { parseWhen, WHEN_HELP } from "./when";
 
 const log = getLogger("assistant");
+
+/** Private chat only: which of the user's shared groups a group-reading tool should look at. */
+const GROUP_PARAM = { type: "string", description: "Which group (private chat only): its number or (part of) its name from the list of shared groups in the instructions. Omit when only one group is shared or the user clearly means the same group as before." };
+/** Tools that read a group's history; in a private chat they gain the `group` parameter. */
+const GROUP_SCOPED = new Set(["summarize_chat", "answer_from_history", "list_pending_items", "set_read_mark"]);
 
 const TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
       name: "summarize_chat",
-      description: "Summarise this group's messages and send the summary to the group. Use when the user asks for a resumen / summary / catch-up.",
+      description: "Summarise the group's messages and send the summary. Use when the user asks for a resumen / summary / catch-up.",
       parameters: {
         type: "object",
         properties: {
@@ -46,7 +54,7 @@ const TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "answer_from_history",
-      description: "Answer a question using the group's stored message history (who said what, what was decided, when…). Sends the answer to the group.",
+      description: "Answer a question using the group's stored message history (who said what, what was decided, when…). Sends the answer.",
       parameters: { type: "object", properties: { question: { type: "string" }, audio: { type: "boolean", description: "true when the user wants the answer as a voice note." } }, required: ["question"] },
     },
   },
@@ -78,7 +86,7 @@ const TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "create_reminder",
-      description: "Schedule a reminder in this group: at the given time the bot posts the text mentioning the member (e.g. 'recuérdame mañana comprar pan', 'avísanos el lunes a las 20:00 de la reunión', 'cada día a las 9 vitaminas'). Use it whenever the member asks to be reminded / warned / told something later.",
+      description: "Schedule a reminder in this chat: at the given time the bot posts the text mentioning the member (in a group) or sends it privately (in a private chat). E.g. 'recuérdame mañana comprar pan', 'avísanos el lunes a las 20:00 de la reunión', 'cada día a las 9 vitaminas'. Use it whenever the member asks to be reminded / warned / told something later.",
       parameters: {
         type: "object",
         properties: {
@@ -93,7 +101,7 @@ const TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "list_reminders",
-      description: "List the pending reminders and scheduled messages of this group (returns data; answer with a short list). Use also before cancelling one.",
+      description: "List the pending reminders and scheduled messages of this group – in a private chat, everything the user has pending anywhere (returns data; answer with a short list). Use also before cancelling one.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -109,7 +117,7 @@ const TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "list_pending_items",
-      description: "Extract what is still open in the chat – tasks, promises, unanswered questions, money owed – from the stored history and send it to the group ('qué tenemos pendiente', 'qué me toca a mí').",
+      description: "Extract what is still open in the group – tasks, promises, unanswered questions, money owed – from the stored history and send it ('qué tenemos pendiente', 'qué me toca a mí').",
       parameters: { type: "object", properties: { since: { type: "string", description: "Period like '7d', '2d', 'hoy'. Default 7d." }, mine: { type: "boolean", description: "true when the member only wants what concerns them." } } },
     },
   },
@@ -192,6 +200,32 @@ const SOCIAL_TOOLS: (ToolDef & { kind: SocialKind })[] = [
 
 const SOCIAL_TOOL_BY_NAME = new Map(SOCIAL_TOOLS.map((t) => [t.function.name, t.kind] as const));
 
+/** Action tools for this chat kind: in a private chat the group-reading tools accept `group`. */
+function actionTools(isDm: boolean): ToolDef[] {
+  if (!isDm) return TOOLS;
+  return TOOLS.map((t) => {
+    if (!GROUP_SCOPED.has(t.function.name)) return t;
+    const params = t.function.parameters as { type: string; properties?: Record<string, unknown>; required?: string[] };
+    return { ...t, function: { ...t.function, parameters: { ...params, properties: { ...(params.properties ?? {}), group: GROUP_PARAM } } } };
+  });
+}
+
+/** Private chat: pick the shared group a tool refers to (number, name or the only one). */
+function pickGroup(groups: Chat[], arg: unknown): { group: Chat } | { error: string } {
+  if (!groups.length) return { error: "the user shares no group with the bot yet; tell them to add the bot to a group and write something there" };
+  const raw = typeof arg === "string" || typeof arg === "number" ? String(arg).trim() : "";
+  const list = groups.map((g, i) => `${i + 1}. ${g.name ?? g.jid}`).join("; ");
+  if (raw) {
+    if (/^\d+$/.test(raw) && Number(raw) >= 1 && Number(raw) <= groups.length) return { group: groups[Number(raw) - 1] };
+    const needle = raw.toLowerCase();
+    const hit = groups.find((g) => (g.name ?? "").toLowerCase() === needle) ?? groups.find((g) => (g.name ?? "").toLowerCase().includes(needle)) ?? groups.find((g) => needle.includes((g.name ?? " ").toLowerCase()));
+    if (hit) return { group: hit };
+    return { error: `no shared group matches "${raw}"; the shared groups are: ${list}. Ask the user which one.` };
+  }
+  if (groups.length === 1) return { group: groups[0] };
+  return { error: `several groups are shared and none was given; ask the user which one: ${list}` };
+}
+
 /** Compact JSON for the model: results only carry what Gemini needs to answer and cite. */
 function socialItemsForModel(kind: SocialKind, items: SocialItem[]) {
   const long = kind === "url" || kind === "youtube_transcript";
@@ -234,8 +268,16 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
     log.info({ reqId: opts.reqId, user: m.senderPhone ?? m.senderJid, lookupsToday: n, limit: e.SOCIAL_DAILY_LIMIT }, "assistant social lookup counted");
   };
   const AUDIO_QUOTA_MSG = `audio quota reached: this user already got ${e.ASSISTANT_AUDIO_DAILY_LIMIT} audios today; tell them briefly (in their language) that the daily audio limit is ${e.ASSISTANT_AUDIO_DAILY_LIMIT} and offer the text version instead`;
-  const alog = log.child({ reqId: opts.reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid });
-  let cleaned = (m.text ?? "").replace(new RegExp(`@${opts.botPhone ?? "0000"}\\b`, "g"), "").replace(/@\S+/g, (x) => (x.toLowerCase().includes(e.BOT_NAME.toLowerCase()) ? "" : x)).trim();
+  const isDm = m.chatKind === "dm";
+  const alog = log.child({ reqId: opts.reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid, dm: isDm });
+  let cleaned = (m.text ?? "")
+    .replace(new RegExp(`@${opts.botPhone ?? "0000"}\\b`, "g"), "")
+    .replace(/@\S+/g, (x) => (x.toLowerCase().includes(e.BOT_NAME.toLowerCase()) ? "" : x))
+    .replace(/(^|\s)@bot(?=$|[\s,.:;!?])/gi, "$1") // the private-chat trigger word
+    .trim();
+  // Private chat: the groups this user shares with the bot (numbered, so "el 2" / "familia" both work)
+  const groups: Chat[] = isDm && m.senderJid ? await groupsForUser(m.senderJid, m.senderPhone).catch(() => []) : [];
+  const groupList = groups.map((g, i) => `${i + 1}. ${g.name ?? g.jid}`).join("\n");
 
   // Replying to a voice note: what was SAID in it is (part of) the request – "recuérdame mañana comprar pan" 🎤 + "@bot"
   let spokenRequest: string | undefined;
@@ -257,7 +299,8 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
     if (transcript && transcript !== "[inaudible]") spokenRequest = transcript;
   }
   if (!cleaned && !spokenRequest) {
-    await opts.reply(`¿Sí? Dime qué necesitas 🙂 (por ejemplo: "@${e.BOT_NAME} resume desde ayer", "haz un audio diciendo…", "manda un sticker de risa", "qué dice midudev en Twitter", "busca un vídeo sobre…")`);
+    const call = isDm ? "@bot" : `@${e.BOT_NAME}`;
+    await opts.reply(`¿Sí? Dime qué necesitas 🙂 (por ejemplo: "${call} resume ${isDm ? "el grupo de la familia" : "desde ayer"}", "haz un audio diciendo…", "manda un sticker de risa", "qué dice midudev en Twitter", "busca un vídeo sobre…")`);
     return;
   }
 
@@ -275,9 +318,14 @@ export async function runAssistant(m: NormalizedMessage, raw: WAMessage, opts: {
         : "";
   if (!cleaned) cleaned = "(no text – see the voice note above)";
 
-  const system = `You are ${e.BOT_NAME}, an assistant living inside the WhatsApp group "${m.chatName ?? m.chatJid}". A member just mentioned you.
+  const where = isDm
+    ? `You are ${e.BOT_NAME}, a WhatsApp assistant. You are in a PRIVATE 1:1 chat with ${m.senderName ?? "a user"}, who just called you with "@bot".
+- The user shares these groups with you (number. name):\n${groupList || "(none yet)"}\n  summarize_chat, answer_from_history, list_pending_items and set_read_mark read ONE of those groups: pass \`group\` (number or name) when the user names one; when only one group is shared it is implicit; if it is unclear which group they mean, ask instead of guessing. The "recent chat context" below is THIS private conversation, not a group.
+- Everything a tool sends arrives HERE, privately – nothing is posted to any group. Reminders created here are private and delivered here.`
+    : `You are ${e.BOT_NAME}, an assistant living inside the WhatsApp group "${m.chatName ?? m.chatJid}". A member just mentioned you.`;
+  const system = `${where}
 - Reply in the language the member used (default Spanish), friendly, brief, WhatsApp style (*bold*, "-" bullets, no # headers, few emojis).
-- Use a tool when the request matches one (summaries, questions about what happened in the chat, voice notes, stickers, transcription, reminders, pending items, read mark). "Recuérdame / avísame / que no se me olvide …" ALWAYS means create_reminder. Tools SEND their output to the group themselves; after a tool ran, answer with ONE short sentence or nothing at all (empty string) – never repeat the content the tool sent.
+- Use a tool when the request matches one (summaries, questions about what happened in the chat, voice notes, stickers, transcription, reminders, pending items, read mark). "Recuérdame / avísame / que no se me olvide …" ALWAYS means create_reminder. Tools SEND their output ${isDm ? "to this chat" : "to the group"} themselves; after a tool ran, answer with ONE short sentence or nothing at all (empty string) – never repeat the content the tool sent.
 - For general questions, chit-chat, jokes, translations, ideas etc. just answer directly in text (no tool). If asked to speak/say something aloud, use send_voice_note with the exact words.
 ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name).join(", ")}) RETURN data to you and send nothing: use them whenever the answer depends on the outside world or on current facts – who someone is, what someone tweeted/published, videos or posts about a topic, news, prices, results, dates, or when a member shares a link and wants it explained/summarised. Pick the platform the member names (Twitter/X → search_tweets or user_tweets, YouTube → search_youtube / youtube_transcript, TikTok → search_tiktok, a URL → read_url, otherwise web_search). If the chat context mentions the subject too, you may combine answer_from_history with a lookup. Then answer in text with the key points and 1-3 plain URLs (no markdown links). If a lookup fails or returns nothing, say so briefly and answer with what you know.` : ""}
 - You can chain tools when needed (e.g. summarise AND send a sticker, web_search THEN read_url).
@@ -290,11 +338,21 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
 
   let sentSomething = false;
   const requester = m.senderJid;
+  /** Chat a group-reading tool works on: the group itself, or (private chat) the shared group picked via `group`. */
+  const targetChat = (args: Record<string, unknown>): { jid: string; name?: string } | { error: string } => {
+    if (!isDm) return { jid: m.chatJid, name: m.chatName };
+    const r = pickGroup(groups, args.group);
+    return "error" in r ? r : { jid: r.group.jid, name: r.group.name ?? undefined };
+  };
+  /** "de <grupo>" suffix for headers when the output does not land in the group itself. */
+  const ofGroup = (name?: string) => (isDm && name ? ` de ${name}` : "");
 
   const exec = async (name: string, args: Record<string, unknown>): Promise<ToolResult> => {
     alog.info({ tool: name, args }, "assistant tool call");
     switch (name) {
       case "summarize_chat": {
+        const target = targetChat(args);
+        if ("error" in target) return { ok: false, info: target.error };
         let audio = Boolean(args.audio) && ttsEnabled();
         let quotaNote = "";
         if (audio && !(await audioAllowed())) {
@@ -304,22 +362,24 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
         const styleArg = String(args.style ?? "bullets");
         const style = audio ? (styleArg === "detailed" ? "spoken_detailed" : "spoken") : (styleArg as "bullets" | "brief" | "detailed");
         try {
-          const res = await runSummary({ chatJid: m.chatJid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, until: m.timestamp, requesterJid: requester, requesterPhone: m.senderPhone, requesterName: m.senderName, style, focus: typeof args.focus === "string" ? args.focus : undefined, trigger: "command", reqId: opts.reqId });
+          const res = await runSummary({ chatJid: target.jid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, until: m.timestamp, requesterJid: requester, requesterPhone: m.senderPhone, requesterName: m.senderName, style, focus: typeof args.focus === "string" ? args.focus : undefined, trigger: "command", reqId: opts.reqId });
           if (audio) {
             await whatsapp.presence(m.chatJid, "recording");
             const a = await synthesize(res.text, { voice: "secondary", reqId: opts.reqId });
             await whatsapp.sendVoice(m.chatJid, a.buffer, { mimetype: a.mimetype, quotedId: m.id });
             await audioUsed();
           } else {
-            await opts.reply(`📝 *Resumen* – ${res.label}\n_${res.messageCount} mensajes · ${fmtZoned(res.from, tz)} → ${fmtZoned(res.to, tz)}_\n\n${res.text}`);
+            await opts.reply(`📝 *Resumen${ofGroup(res.chatName ?? target.name)}* – ${res.label}\n_${res.messageCount} mensajes · ${fmtZoned(res.from, tz)} → ${fmtZoned(res.to, tz)}_\n\n${res.text}`);
           }
           sentSomething = true;
-          return { ok: true, sent: true, info: `summary sent (${res.messageCount} messages, ${res.label})${quotaNote}` };
+          return { ok: true, sent: true, info: `summary of ${res.chatName ?? target.jid} sent (${res.messageCount} messages, ${res.label})${quotaNote}` };
         } catch (err) {
           return { ok: false, info: isAppError(err) ? `${err.message} ${err.hint ?? ""}` : errInfo(err).message };
         }
       }
       case "answer_from_history": {
+        const target = targetChat(args);
+        if ("error" in target) return { ok: false, info: target.error };
         let audio = Boolean(args.audio) && ttsEnabled();
         let quotaNote = "";
         if (audio && !(await audioAllowed())) {
@@ -327,7 +387,7 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
           quotaNote = ` (audio not sent: daily audio limit of ${e.ASSISTANT_AUDIO_DAILY_LIMIT} reached, text sent instead – mention it in one short sentence)`;
         }
         try {
-          const res = await runQuestion({ chatJid: m.chatJid, question: String(args.question ?? cleaned), reqId: opts.reqId, spoken: audio });
+          const res = await runQuestion({ chatJid: target.jid, question: String(args.question ?? cleaned), reqId: opts.reqId, spoken: audio });
           if (audio) {
             await whatsapp.presence(m.chatJid, "recording");
             const a = await synthesize(res.text, { voice: "secondary", reqId: opts.reqId });
@@ -399,32 +459,44 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
         return { ok: true, info: `reminder #${job.id} created: ${when.label} → "${job.text}". Confirm in one short sentence with the day and time (${fmtZoned(job.dueAt, tz)}${when.recurrence ? ", recurring" : ""}).` };
       }
       case "list_reminders": {
-        const rows = await listJobs({ chatJid: m.chatJid, status: ["pending"], limit: 20 });
-        return { ok: true, info: rows.length ? `${rows.length} pending; answer with a short list (id · when · text)` : "nothing pending in this group", data: rows.map((j) => ({ id: j.id, when: fmtZoned(j.dueAt, tz), text: j.text, by: j.createdByName, recurring: Boolean(j.recurrence), kind: j.kind })) };
+        // In a group: everything scheduled there. In a private chat: everything this user created, wherever it will be posted.
+        const rows = isDm && requester ? await listJobs({ createdBy: requester, status: ["pending"], limit: 20 }) : await listJobs({ chatJid: m.chatJid, status: ["pending"], limit: 20 });
+        const names = new Map<string, string>();
+        if (isDm) for (const j of rows) if (j.chatJid !== m.chatJid && !names.has(j.chatJid)) names.set(j.chatJid, (await getChat(j.chatJid))?.name ?? j.chatJid);
+        return {
+          ok: true,
+          info: rows.length ? `${rows.length} pending; answer with a short list (id · when · text${isDm ? " · where" : ""})` : isDm ? "the user has nothing pending" : "nothing pending in this group",
+          data: rows.map((j) => ({ id: j.id, when: fmtZoned(j.dueAt, tz), text: j.text, by: j.createdByName, recurring: Boolean(j.recurrence), kind: j.kind, ...(isDm ? { where: names.get(j.chatJid) ?? "this private chat" } : {}) })),
+        };
       }
       case "cancel_reminder": {
         const id = Number(args.id);
         const job = Number.isInteger(id) ? await getJob(id) : undefined;
-        if (!job || job.chatJid !== m.chatJid) return { ok: false, info: `no reminder #${args.id} in this group` };
+        // In a group only that group's jobs are reachable; in a private chat the user reaches their own jobs anywhere.
+        if (!job || (!isDm && job.chatJid !== m.chatJid) || (isDm && !opts.isAdmin && job.createdBy !== requester)) return { ok: false, info: `no reminder #${args.id} ${isDm ? "of yours" : "in this group"}` };
         if (!opts.isAdmin && job.createdBy !== requester) return { ok: false, info: "only its creator or an admin can cancel it" };
         const c = await cancelJob(job.id);
         return c ? { ok: true, info: `reminder #${job.id} cancelled ("${job.text}")` } : { ok: false, info: `reminder #${job.id} is ${job.status}, not pending` };
       }
       case "list_pending_items": {
+        const target = targetChat(args);
+        if ("error" in target) return { ok: false, info: target.error };
         try {
           const mine = Boolean(args.mine);
-          const res = await runActionItems({ chatJid: m.chatJid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, requesterJid: requester, requesterPhone: m.senderPhone, forName: mine ? (m.senderName ?? m.senderPhone) : undefined, forPhone: mine ? m.senderPhone : undefined, reqId: opts.reqId });
-          await opts.reply(`📋 *Pendientes${mine ? " tuyos" : ""}* – ${res.label}\n\n${res.text}`);
+          const res = await runActionItems({ chatJid: target.jid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, requesterJid: requester, requesterPhone: m.senderPhone, forName: mine ? (m.senderName ?? m.senderPhone) : undefined, forPhone: mine ? m.senderPhone : undefined, reqId: opts.reqId });
+          await opts.reply(`📋 *Pendientes${mine ? " tuyos" : ""}${ofGroup(res.chatName ?? target.name)}* – ${res.label}\n\n${res.text}`);
           sentSomething = true;
-          return { ok: true, sent: true, info: `pending items sent (${res.messageCount} messages read)` };
+          return { ok: true, sent: true, info: `pending items of ${res.chatName ?? target.jid} sent (${res.messageCount} messages read)` };
         } catch (err) {
           return { ok: false, info: isAppError(err) ? `${err.message} ${err.hint ?? ""}` : errInfo(err).message };
         }
       }
       case "set_read_mark": {
         if (!requester) return { ok: false, info: "unknown requester" };
-        await setReadMark(m.chatJid, requester, m.timestamp);
-        return { ok: true, info: "read mark set; next summary starts here" };
+        const target = targetChat(args);
+        if ("error" in target) return { ok: false, info: target.error };
+        await setReadMark(target.jid, requester, m.timestamp);
+        return { ok: true, info: `read mark set${isDm ? ` in ${target.name ?? target.jid}` : ""}; next summary starts here` };
       }
       default: {
         const kind = SOCIAL_TOOL_BY_NAME.get(name);
@@ -447,7 +519,7 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
 
   const model = e.ASSISTANT_MODEL ?? e.ASK_MODEL;
   for (let round = 0; round < 6; round++) {
-    const res = await chatComplete(messages, { model, tools: [...TOOLS, ...socialTools], temperature: 0.4, maxTokens: 1500, reqId: opts.reqId });
+    const res = await chatComplete(messages, { model, tools: [...actionTools(isDm), ...socialTools], temperature: 0.4, maxTokens: 1500, reqId: opts.reqId });
     if (res.toolCalls?.length) {
       messages.push({ role: "assistant", content: res.text || null, tool_calls: res.toolCalls });
       for (const call of res.toolCalls) {

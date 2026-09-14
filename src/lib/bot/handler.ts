@@ -38,6 +38,8 @@ import { toStickerWebp } from "../whatsapp/sticker";
 const log = getLogger("bot");
 const lastRun = new Map<string, number>();
 const COOLDOWN_MS = 15_000;
+/** "@bot" as a standalone word anywhere in a private-chat message ("@bot resume el grupo", "hola @bot"). */
+export const DM_ASSISTANT_TRIGGER = /(^|\s)@bot(?=$|[\s,.:;!?])/i;
 
 function fmtRange(from: Date, to: Date) {
   const tz = env().BOT_TIMEZONE;
@@ -62,11 +64,13 @@ export async function handleInbound(m: NormalizedMessage, raw: WAMessage): Promi
   const isDm = m.chatKind === "dm";
   const e = env();
 
-  // Assistant mode: explicit @mention in a GROUP with free text (slash commands still work as before).
-  // Quoting/replying to the bot does not count as a mention.
-  if (botMentioned && !isDm && e.ASSISTANT_ENABLED && !(m.text ?? "").trim().startsWith(e.BOT_COMMAND_PREFIX)) {
+  // Assistant mode with free text (slash commands still work as before):
+  //  - in a GROUP: an explicit @mention of the bot (quoting/replying to the bot does not count);
+  //  - in a PRIVATE chat: WhatsApp has no mention picker, so the literal word "@bot" (any case) calls the assistant.
+  const assistantCalled = isDm ? DM_ASSISTANT_TRIGGER.test(m.text ?? "") : botMentioned;
+  if (assistantCalled && e.ASSISTANT_ENABLED && !(m.text ?? "").trim().startsWith(e.BOT_COMMAND_PREFIX)) {
     const alog = log.child({ reqId, chat: m.chatJid, from: m.senderPhone ?? m.senderJid, mode: "assistant" });
-    alog.info({ text: m.text?.slice(0, 160) }, "assistant mention");
+    alog.info({ text: m.text?.slice(0, 160), via: isDm ? "@bot (dm)" : "mention" }, "assistant called");
     await markMessageAsCommand(m.chatJid, m.id).catch(() => {});
     const reply = (text: string) => whatsapp.sendText(m.chatJid, text, { quotedId: m.id });
     if (m.senderJid && e.ASSISTANT_DAILY_LIMIT > 0 && !isAdmin(m.senderPhone)) {
