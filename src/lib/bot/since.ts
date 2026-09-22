@@ -84,7 +84,7 @@ export function parseSince(input: string | undefined, opts: { now?: Date; timeZo
   };
 
   if (!s || ["desde", "last", "ultimo", "último", "continuar", "continue", "resumen"].includes(s)) return { kind: "last", label: "desde tu último resumen" };
-  if (/^(mi (ultimo |último )?mensaje|mio|mío|me|my (last )?message|yo)$/.test(s)) return { kind: "mymessage", label: "desde tu último mensaje" };
+  if (/^(mi ?(ultimo |último )?mensaje|mimensaje|mio|mío|me|my ?(last )?message|mymessage|yo)$/.test(s)) return { kind: "mymessage", label: "desde tu último mensaje" };
   if (["todo", "all", "everything"].includes(s)) return { kind: "all", label: "todo el historial" };
 
   // hoy / today [time]

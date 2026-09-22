@@ -42,7 +42,7 @@ const TOOLS: ToolDef[] = [
       parameters: {
         type: "object",
         properties: {
-          since: { type: "string", description: "Period expression in the bot's syntax: 'last' (since the user's last summary), 'mymessage', 'hoy', 'ayer', 'ayer 15:00', 'lunes', '08/09 10:30', '3h', '2d', '50' (messages), 'todo'. Default 'last'." },
+          since: { type: "string", description: "Period expression in the bot's syntax: 'last' (since the user's last summary), 'mymessage', 'hoy', 'ayer', 'ayer 15:00', 'lunes', '08/09 10:30', '3h', '2d', '50' (messages), 'todo'. Default 'last'. When the member is replying to / quoting a specific message ('resume este mensaje'), the summary starts from that quoted message automatically – you can omit 'since'." },
           style: { type: "string", enum: ["bullets", "brief", "detailed"], description: "Length/format. Default bullets." },
           audio: { type: "boolean", description: "true when the user wants the summary as a voice note / audio." },
           focus: { type: "string", description: "Optional topic to focus on." },
@@ -385,7 +385,16 @@ ${socialTools.length ? `- LOOKUP tools (${socialTools.map((t) => t.function.name
         const styleArg = String(args.style ?? "bullets");
         const style = audio ? (styleArg === "detailed" ? "spoken_detailed" : "spoken") : (styleArg as "bullets" | "brief" | "detailed");
         try {
-          const res = await runSummary({ chatJid: target.jid, since: typeof args.since === "string" && args.since.trim() ? args.since : undefined, until: m.timestamp, requesterJid: requester, requesterPhone: m.senderPhone, requesterName: m.senderName, style, focus: typeof args.focus === "string" ? args.focus : undefined, trigger: "command", reqId: opts.reqId });
+          // If the member is pointing at a specific earlier message (a reply/quote in THIS chat, not their
+          // own voice-note request), summarise from that message – same rule as the /resumen command. So
+          // "@bot resume este mensaje" works even when the model picks a period that does not apply.
+          const since =
+            quoted && target.jid === m.chatJid && !ownAudio
+              ? { kind: "time" as const, since: new Date(quoted.timestamp.getTime() - 1000), label: "desde el mensaje citado" }
+              : typeof args.since === "string" && args.since.trim()
+                ? args.since
+                : undefined;
+          const res = await runSummary({ chatJid: target.jid, since, until: m.timestamp, requesterJid: requester, requesterPhone: m.senderPhone, requesterName: m.senderName, style, focus: typeof args.focus === "string" ? args.focus : undefined, trigger: "command", reqId: opts.reqId });
           if (audio) {
             await whatsapp.presence(m.chatJid, "recording");
             const a = await synthesize(res.text, { voice: "secondary", reqId: opts.reqId });
