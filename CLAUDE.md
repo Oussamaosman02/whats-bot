@@ -9,7 +9,7 @@ API-only Next.js 16 app (App Router, TypeScript) that runs a WhatsApp group-summ
 - Assistant mode (@mention): `src/lib/bot/assistant.ts` (Gemini tool calling). Lookup tools live in `src/lib/social/` (twitterapi.io + transcriptapi.com direct, monid.ai primary for web/scrape/TikTok, treg.to routed catalog as fallback); every lookup is recorded in `social_lookups`.
 - Every route uses `route()` from `src/lib/api.ts` (reqId, logging, error JSON). Throw `AppError` with a `hint`.
 - Logs: pino via `src/lib/logger.ts`; always log `{ err, hint }` on failure.
-- Deploy: Railway (Dockerfile). See README.md.
+- Deploy (since 2026-11-08): Dokploy on 72.62.27.167, https://whats-bot.foodio.es. GitHub Actions (.github/workflows/docker.yml) builds ghcr.io/oussamaosman02/whats-bot on push to main; Dokploy app `whats-bot` only pulls + runs it (512 MB cap, auto-deploy off: click Deploy in Dokploy after the Action finishes). NEVER build on that VPS — a `next build` there took every app down. DB = shared-pg (internal host shared-pg-aegavo). Railway service is stopped (old deploy method).
 
 <!-- BEGIN:nextjs-agent-rules -->
 
