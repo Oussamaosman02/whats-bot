@@ -23,6 +23,8 @@ const schema = z.object({
 
   OPENROUTER_API_KEY: optionalString,
   GEMINI_MODEL: z.string().default("google/gemini-2.5-flash-lite"),
+  /** Comma-separated google/gemini-* ids OpenRouter falls back to when the main model is rate-limited/down. */
+  GEMINI_FALLBACK_MODELS: z.string().default("google/gemini-2.5-flash"),
 
   ZERNIO_API_KEY: optionalString,
   ZERNIO_WHATSAPP_ACCOUNT_ID: optionalString,

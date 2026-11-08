@@ -8,6 +8,8 @@ import { getLogger, errInfo } from "../logger";
 
 const log = getLogger("ai");
 const BASE = "https://openrouter.ai/api/v1";
+/** Backoff between attempts on 429/5xx (Google AI Studio's shared pool throttles in short bursts). */
+const RETRY_DELAYS_MS = [1500, 4000];
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -73,15 +75,29 @@ export async function chatComplete(
   }
   log.debug({ model, messages: messages.length, chars: messages.reduce((n, m) => n + contentChars(m.content), 0), parts: contentKinds(messages), reqId: opts.reqId }, "→ openrouter chat/completions");
 
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}/chat/completions`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
-  } catch (e) {
-    log.error({ err: errInfo(e), hint: "Network error reaching openrouter.ai – check outbound connectivity / DNS." }, "openrouter request failed");
-    throw new AppError(502, "ai_network_error", `Could not reach OpenRouter: ${errInfo(e).message}`, { hint: "Check outbound network access from the server.", cause: e });
+  // OpenRouter tries `models` in order when one is rate-limited/down (Gemini only).
+  const fallbacks = env()
+    .GEMINI_FALLBACK_MODELS.split(",")
+    .map((m) => m.trim())
+    .filter((m) => m.startsWith("google/gemini") && m !== model);
+  if (fallbacks.length) body.models = [model, ...fallbacks];
+
+  let res!: Response;
+  let raw = "";
+  for (let attempt = 1; attempt <= RETRY_DELAYS_MS.length + 1; attempt++) {
+    try {
+      res = await fetch(`${BASE}/chat/completions`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    } catch (e) {
+      log.error({ err: errInfo(e), hint: "Network error reaching openrouter.ai – check outbound connectivity / DNS." }, "openrouter request failed");
+      throw new AppError(502, "ai_network_error", `Could not reach OpenRouter: ${errInfo(e).message}`, { hint: "Check outbound network access from the server.", cause: e });
+    }
+    raw = await res.text();
+    const delay = RETRY_DELAYS_MS[attempt - 1];
+    if (!(res.status === 429 || res.status >= 500) || delay === undefined) break;
+    log.warn({ status: res.status, model, attempt, retryInMs: delay, body: raw.slice(0, 300), hint: "Transient upstream error (Google shared-pool rate limit / 5xx); retrying." }, "openrouter retry");
+    await new Promise((r) => setTimeout(r, delay));
   }
 
-  const raw = await res.text();
   let json: Record<string, unknown> = {};
   try {
     json = JSON.parse(raw);
